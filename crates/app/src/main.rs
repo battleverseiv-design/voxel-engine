@@ -20,7 +20,7 @@ use engine_net::{
 use engine_render::{build_avatar_mesh, build_first_person_arm_mesh, Camera, RenderError, Renderer};
 use engine_world::{world_to_chunk, VoxelContraption, World, WorldStreamer, CHUNK_SIZE_I32};
 use game_survival::{LithosphereWorldGen, SurvivalMode};
-use glam::{IVec3, Quat, Vec3};
+use glam::{IVec3, Vec3};
 use settings::{keycode_to_name, name_to_keycode, Settings};
 use world_manager::{WorldManager, WorldMeta};
 use winit::application::ApplicationHandler;
@@ -1031,7 +1031,7 @@ impl EngineApp {
                 block.transform.local_velocity.x *= (1.0 - 0.8 * dt).max(0.0);
                 block.transform.local_velocity.z *= (1.0 - 0.8 * dt).max(0.0);
 
-                let old_pos = block.transform.local_offset;
+                let old_pos = block.transform.world_position();
                 let mut new_pos = old_pos + block.transform.local_velocity * dt;
 
                 let bottom_center = new_pos + Vec3::new(0.5, 0.05, 0.5);
@@ -1039,16 +1039,16 @@ impl EngineApp {
                 if self.registry.is_solid(self.world.get_block(check_voxel)) {
                     new_pos.y = check_voxel.y as f32 + 1.0;
                     block.transform.local_velocity = Vec3::ZERO;
+                    audio::play_sound(audio::SoundEffect::FootstepStone);
                 }
-                block.transform.local_offset = new_pos;
-                block.transform.normalize();
+                block.transform.set_world_position(new_pos);
             }
         }
 
         // Player collision: allow player to stand on and collide with the physical block
         let feet = self.player_feet();
         for block in &self.test_physics_blocks {
-            let b_min = block.transform.local_offset;
+            let b_min = block.transform.world_position();
             let b_max = b_min + Vec3::splat(1.0);
             if feet.x >= b_min.x - 0.28
                 && feet.x <= b_max.x + 0.28
@@ -4015,21 +4015,17 @@ impl ApplicationHandler for EngineApp {
                                 }
 
                                 // ===== [TEMPORARY PHYSICS TEST: START] =====
-                                if code == KeyCode::KeyG && !event.repeat {
+                                if (code == KeyCode::KeyG || code == KeyCode::KeyU) && !event.repeat {
                                     let held_id = self.inventory.selected_block();
                                     let spawn_block_id = if held_id == BlockId::AIR { BlockId(1) } else { held_id };
 
-                                    let spawn_origin = self.camera.position + self.camera.forward() * 1.6 - Vec3::new(0.5, 0.5, 0.5);
-                                    let impulse = self.camera.forward() * 8.5 + Vec3::new(0.0, 3.2, 0.0);
+                                    let spawn_origin = self.camera.position + self.camera.forward() * 2.0 - Vec3::new(0.5, 0.5, 0.5);
+                                    let impulse = self.camera.forward() * 7.5 + Vec3::new(0.0, 3.2, 0.0);
+                                    let mut transform = RelativeTransform::new(ReferenceFrameId::UNIVERSE_ROOT, IVec3::ZERO, spawn_origin);
+                                    transform.local_velocity = impulse;
                                     let mut contraption = VoxelContraption::new(
                                         (self.test_physics_blocks.len() + 1) as u64,
-                                        RelativeTransform {
-                                            parent_frame: ReferenceFrameId::UNIVERSE_ROOT,
-                                            sector: IVec3::ZERO,
-                                            local_offset: spawn_origin,
-                                            local_rotation: Quat::IDENTITY,
-                                            local_velocity: impulse,
-                                        },
+                                        transform,
                                         1.0,
                                     );
                                     contraption.set_block(IVec3::ZERO, spawn_block_id);
@@ -4041,9 +4037,10 @@ impl ApplicationHandler for EngineApp {
                                         self.test_physics_blocks.remove(0);
                                     }
 
+                                    audio::play_sound(audio::SoundEffect::FootstepStone);
                                     let block_name = self.registry.get(spawn_block_id).map(|d| d.name.as_str()).unwrap_or("block");
                                     self.push_chat(
-                                        format!("Брошен физический блок: {block_name} (нажмите G для повтора)"),
+                                        format!("Брошен физический блок: {block_name} (нажмите G или Г для повтора)"),
                                         egui::Color32::from_rgb(100, 220, 255),
                                     );
                                 }

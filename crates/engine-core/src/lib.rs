@@ -56,6 +56,18 @@ impl RelativeTransform {
         t
     }
 
+    #[inline]
+    pub fn world_position(&self) -> Vec3 {
+        self.sector.as_vec3() * SECTOR_SIZE + self.local_offset
+    }
+
+    #[inline]
+    pub fn set_world_position(&mut self, pos: Vec3) {
+        self.sector = IVec3::ZERO;
+        self.local_offset = pos;
+        self.normalize();
+    }
+
     /// Normalizes `local_offset` mathematically so that each axis coordinate lies strictly within `[0.0, SECTOR_SIZE)`,
     /// adjusting `sector` using euclidean division (`div_euclid` / `rem_euclid`).
     pub fn normalize(&mut self) {

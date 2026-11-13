@@ -769,12 +769,13 @@ impl VoxelContraption {
 
     /// Transforms a point from contraption local coordinates to world coordinates.
     pub fn transform_point_to_world(&self, local_pt: Vec3) -> Vec3 {
-        self.transform.local_offset + self.transform.local_rotation * (local_pt * self.voxel_scale)
+        let origin = self.transform.world_position();
+        origin + self.transform.local_rotation * (local_pt * self.voxel_scale)
     }
 
     /// Transforms a point from world coordinates to contraption local coordinates.
     pub fn transform_point_to_local(&self, world_pt: Vec3) -> Vec3 {
-        let rel = world_pt - self.transform.local_offset;
+        let rel = world_pt - self.transform.world_position();
         (self.transform.local_rotation.inverse() * rel) / self.voxel_scale
     }
 }

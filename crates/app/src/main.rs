@@ -10,16 +10,17 @@ use std::time::Instant;
 
 use engine_core::{
     AvatarModel, BlockId, BlockRegistry, CommandHost, CommandRegistry, EnvironmentProvider,
-    GameMode, Inventory, ItemStack, MaterialRegistry, PlayerMode, WorldGenerator,
+    GameMode, Inventory, ItemStack, MaterialRegistry, PlayerMode, ReferenceFrameId,
+    RelativeTransform, WorldGenerator,
 };
 use engine_net::{
     ClientEvent, DiscoveryBeacon, DiscoveryScanner, GameClient, HostEvent,
     Packet, RemotePlayer, ServerHost, DEFAULT_PORT,
 };
 use engine_render::{build_avatar_mesh, build_first_person_arm_mesh, Camera, RenderError, Renderer};
-use engine_world::{world_to_chunk, World, WorldStreamer, CHUNK_SIZE_I32};
+use engine_world::{world_to_chunk, VoxelContraption, World, WorldStreamer, CHUNK_SIZE_I32};
 use game_survival::{LithosphereWorldGen, SurvivalMode};
-use glam::{IVec3, Vec3};
+use glam::{IVec3, Quat, Vec3};
 use settings::{keycode_to_name, name_to_keycode, Settings};
 use world_manager::{WorldManager, WorldMeta};
 use winit::application::ApplicationHandler;
@@ -183,6 +184,9 @@ struct EngineApp {
     death_fall_progress: f32,
     step_timer: f32,
     last_regen_sync: Instant,
+    // ===== [TEMPORARY PHYSICS TEST: START] =====
+    test_physics_blocks: Vec<VoxelContraption>,
+    // ===== [TEMPORARY PHYSICS TEST: END] =====
 }
 
 fn render_inventory_slot(
@@ -396,6 +400,9 @@ impl EngineApp {
             death_fall_progress: 0.0,
             step_timer: 0.0,
             last_regen_sync: now,
+            // ===== [TEMPORARY PHYSICS TEST: START] =====
+            test_physics_blocks: Vec::new(),
+            // ===== [TEMPORARY PHYSICS TEST: END] =====
         };
 
         app.push_chat(
@@ -410,6 +417,12 @@ impl EngineApp {
             "Подсказка: /gamemode creative переключает в креатив (двойной пробел — полёт).",
             egui::Color32::from_rgb(180, 210, 255),
         );
+        // ===== [TEMPORARY PHYSICS TEST: START] =====
+        app.push_chat(
+            "Подсказка: [G] бросает физический блок перед вами (тест физики и коллизий).",
+            egui::Color32::from_rgb(100, 220, 255),
+        );
+        // ===== [TEMPORARY PHYSICS TEST: END] =====
 
         app
     }
@@ -1009,6 +1022,49 @@ impl EngineApp {
             self.on_ground = landed;
             self.set_player_feet(new_feet);
         }
+
+        // ===== [TEMPORARY PHYSICS TEST: START] =====
+        let grav = Vec3::new(0.0, -20.0, 0.0);
+        for block in &mut self.test_physics_blocks {
+            if block.transform.local_velocity.length_squared() > 0.001 {
+                block.transform.local_velocity += grav * dt;
+                block.transform.local_velocity.x *= (1.0 - 0.8 * dt).max(0.0);
+                block.transform.local_velocity.z *= (1.0 - 0.8 * dt).max(0.0);
+
+                let old_pos = block.transform.local_offset;
+                let mut new_pos = old_pos + block.transform.local_velocity * dt;
+
+                let bottom_center = new_pos + Vec3::new(0.5, 0.05, 0.5);
+                let check_voxel = bottom_center.floor().as_ivec3();
+                if self.registry.is_solid(self.world.get_block(check_voxel)) {
+                    new_pos.y = check_voxel.y as f32 + 1.0;
+                    block.transform.local_velocity = Vec3::ZERO;
+                }
+                block.transform.local_offset = new_pos;
+                block.transform.normalize();
+            }
+        }
+
+        // Player collision: allow player to stand on and collide with the physical block
+        let feet = self.player_feet();
+        for block in &self.test_physics_blocks {
+            let b_min = block.transform.local_offset;
+            let b_max = b_min + Vec3::splat(1.0);
+            if feet.x >= b_min.x - 0.28
+                && feet.x <= b_max.x + 0.28
+                && feet.z >= b_min.z - 0.28
+                && feet.z <= b_max.z + 0.28
+                && feet.y >= b_max.y - 0.35
+                && feet.y <= b_max.y + 0.30
+                && self.velocity.y <= 0.0
+            {
+                self.set_player_feet(Vec3::new(feet.x, b_max.y, feet.z));
+                self.velocity.y = 0.0;
+                self.on_ground = true;
+                break;
+            }
+        }
+        // ===== [TEMPORARY PHYSICS TEST: END] =====
 
 
         let horiz_speed = Vec3::new(self.velocity.x, 0.0, self.velocity.z).length();
@@ -3957,6 +4013,41 @@ impl ApplicationHandler for EngineApp {
                                         egui::Color32::from_rgb(255, 215, 120),
                                     );
                                 }
+
+                                // ===== [TEMPORARY PHYSICS TEST: START] =====
+                                if code == KeyCode::KeyG && !event.repeat {
+                                    let held_id = self.inventory.selected_block();
+                                    let spawn_block_id = if held_id == BlockId::AIR { BlockId(1) } else { held_id };
+
+                                    let spawn_origin = self.camera.position + self.camera.forward() * 1.6 - Vec3::new(0.5, 0.5, 0.5);
+                                    let impulse = self.camera.forward() * 8.5 + Vec3::new(0.0, 3.2, 0.0);
+                                    let mut contraption = VoxelContraption::new(
+                                        (self.test_physics_blocks.len() + 1) as u64,
+                                        RelativeTransform {
+                                            parent_frame: ReferenceFrameId::UNIVERSE_ROOT,
+                                            sector: IVec3::ZERO,
+                                            local_offset: spawn_origin,
+                                            local_rotation: Quat::IDENTITY,
+                                            local_velocity: impulse,
+                                        },
+                                        1.0,
+                                    );
+                                    contraption.set_block(IVec3::ZERO, spawn_block_id);
+                                    contraption.rebuild_meshes(&self.registry);
+                                    contraption.rebuild_colliders();
+
+                                    self.test_physics_blocks.push(contraption);
+                                    if self.test_physics_blocks.len() > 32 {
+                                        self.test_physics_blocks.remove(0);
+                                    }
+
+                                    let block_name = self.registry.get(spawn_block_id).map(|d| d.name.as_str()).unwrap_or("block");
+                                    self.push_chat(
+                                        format!("Брошен физический блок: {block_name} (нажмите G для повтора)"),
+                                        egui::Color32::from_rgb(100, 220, 255),
+                                    );
+                                }
+                                // ===== [TEMPORARY PHYSICS TEST: END] =====
                             }
                             self.input.keys.insert(code);
                         }
@@ -4128,6 +4219,23 @@ impl ApplicationHandler for EngineApp {
                     }
                     all_avatar_verts.extend(verts);
                 }
+
+                // ===== [TEMPORARY PHYSICS TEST: START] =====
+                for block in &self.test_physics_blocks {
+                    for (_pos, mesh) in &block.meshes {
+                        for &idx in &mesh.indices {
+                            if let Some(v_orig) = mesh.vertices.get(idx as usize) {
+                                let mut v = *v_orig;
+                                let local_pt = Vec3::from_array(v.position);
+                                v.position = block.transform_point_to_world(local_pt).to_array();
+                                let world_norm = block.transform.local_rotation * Vec3::from_array(v.normal);
+                                v.normal = world_norm.to_array();
+                                all_avatar_verts.push(v);
+                            }
+                        }
+                    }
+                }
+                // ===== [TEMPORARY PHYSICS TEST: END] =====
 
                 let avatar_verts = if all_avatar_verts.is_empty() {
                     None

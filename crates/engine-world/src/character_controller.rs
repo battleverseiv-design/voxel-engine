@@ -350,26 +350,10 @@ impl CharacterController {
         let eye_alpha = 1.0 - (-eye_lerp_rate * dt).exp();
         self.smoothed_eye_y += (target_eye_y - self.smoothed_eye_y) * eye_alpha;
 
-        // Procedural View Bobbing
-        let bob_amp = if self.on_ground && horiz_speed > 0.15 {
-            (horiz_speed / self.config.sprint_speed).min(1.0)
-        } else {
-            0.0
-        };
-        self.bob_phase += horiz_speed * dt * 5.2;
-        let view_bob = Vec3::new(
-            (self.bob_phase * 0.5).sin() * 0.028 * bob_amp,
-            (self.bob_phase).sin().abs() * 0.042 * bob_amp,
-            0.0,
-        );
-
-        // Strafe Roll Angle (camera tilts into sideways movements)
-        let (sin_y, cos_y) = input.look_yaw.sin_cos();
-        let right_dir = Vec3::new(cos_y, 0.0, sin_y).normalize_or_zero();
-        let strafe_dot = self.velocity.dot(right_dir);
-        let target_roll = (-strafe_dot * 0.0055).clamp(-0.045, 0.045);
-        let roll_alpha = 1.0 - (-10.0 * dt).exp();
-        self.strafe_roll_angle += (target_roll - self.strafe_roll_angle) * roll_alpha;
+        // Procedural View Bobbing & camera roll disabled for smooth, shake-free walking
+        self.bob_phase += horiz_speed * dt * 4.0;
+        let view_bob = Vec3::ZERO;
+        self.strafe_roll_angle = 0.0;
 
         ControllerOutput {
             position: self.position,

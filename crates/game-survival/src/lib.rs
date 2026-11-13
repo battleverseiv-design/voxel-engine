@@ -718,9 +718,9 @@ impl GameMode for SurvivalMode {
         // 74. Tall Grass (Wild prairie grass, drops plant fibers)
         let mut grass_def = BlockDef::solid_tinted(
             "survival:tall_grass",
-            [0.55, 0.85, 0.35],
-            [0.55, 0.85, 0.35],
-            [0.55, 0.85, 0.35],
+            white,
+            white,
+            white,
         )
         .with_texture(81)
         .with_geometry(BlockGeometry::Cross)
@@ -736,9 +736,9 @@ impl GameMode for SurvivalMode {
         // 75. Shrub / Bush (Dry wild bush, drops sticks & fibers)
         let mut shrub_def = BlockDef::solid_tinted(
             "survival:shrub",
-            [0.65, 0.72, 0.42],
-            [0.65, 0.72, 0.42],
-            [0.65, 0.72, 0.42],
+            white,
+            white,
+            white,
         )
         .with_texture(82)
         .with_geometry(BlockGeometry::Cross)

@@ -147,7 +147,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let sss_strength = in.material_params.w;
 
     let N = normalize(in.normal);
-    let L = normalize(scene.sun_dir.xyz);
+    let is_day = scene.sun_dir.y >= -0.05;
+    let L = select(
+        normalize(vec3<f32>(-scene.sun_dir.x, max(-scene.sun_dir.y, 0.12), -scene.sun_dir.z)),
+        normalize(vec3<f32>(scene.sun_dir.x, max(scene.sun_dir.y, 0.08), scene.sun_dir.z)),
+        is_day
+    );
     let V = normalize(scene.camera_pos.xyz - in.world_pos);
     let H = normalize(V + L);
 
@@ -156,72 +161,72 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let ndoth = max(dot(N, H), 0.0);
     let vdoth = max(dot(V, H), 0.0);
 
-    // Volumetric Minecraft/BSL face lighting weighting (for crisp 3D shape definition):
-    var face_weight = 1.0;
-    if (N.y > 0.5) {
-        face_weight = 1.0;
-    } else if (N.y < -0.5) {
-        face_weight = 0.52;
-    } else if (abs(N.x) > 0.5) {
-        face_weight = 0.82;
-    } else {
-        face_weight = 0.68;
-    }
-
     // Dynamic Cascaded Shadow factor (0.0 in shadow, 1.0 in sun)
     let shadow_factor = calculate_shadow(in.world_pos, N);
-    let sun_light = scene.sun_color.rgb * scene.sun_dir.w * 0.80;
+    let direct_light = scene.sun_color.rgb * scene.sun_dir.w * 0.85;
 
-    // BSL / Complementary style hemisphere ambient:
+    // FastPBR / SEUS style natural hemisphere ambient:
     let sky_up = max(N.y, 0.0);
     let ground_down = max(-N.y, 0.0);
     let side_term = max(1.0 - abs(N.y), 0.0);
-    let ambient = scene.ambient_sky.rgb * (sky_up * 0.75 + side_term * 0.50)
-                + scene.ambient_ground.rgb * (ground_down * 0.60 + side_term * 0.35);
+    let ambient = scene.ambient_sky.rgb * (sky_up * 0.80 + side_term * 0.55)
+                + scene.ambient_ground.rgb * (ground_down * 0.65 + side_term * 0.40);
 
-    let ao_val = pow(in.ao, 1.35);
+    let ao_val = pow(in.ao, 1.25);
     var lit_color = vec3<f32>(0.0);
 
     if (shading_model == 4u) {
-        // --- 4. Realistic Cinematic Water (Multi-frequency ripples, Fresnel, caustics, and specular) ---
+        // --- SEUS Renewed Water Model ---
         let time = scene.sky_zenith.w;
-        let wp = in.world_pos.xz;
-        
-        // Two dual-frequency ripple directions creating gentle, organic water currents
-        let r1 = sin(wp.x * 1.4 + wp.y * 1.1 + time * 1.6) * 0.025;
-        let r2 = cos(wp.x * 2.2 - wp.y * 1.8 + time * 2.1) * 0.020;
-        let r3 = sin(-wp.x * 3.1 + wp.y * 2.6 + time * 2.8) * 0.012;
-        let ripple_n = normalize(vec3<f32>(r1 + r2, 1.0, r2 + r3));
-        let water_N = normalize(mix(N, ripple_n, 0.42));
+        let p = in.world_pos.xz;
+
+        // Multi-octave wave synthesis with dual counter-propagating ripple frequencies
+        let w1 = sin(p.x * 0.95 + p.y * 0.65 + time * 1.4) * 0.035;
+        let w2 = cos(p.x * 1.85 - p.y * 1.35 + time * 2.1) * 0.022;
+        let w3 = sin(-p.x * 3.4 + p.y * 2.7 + time * 3.2) * 0.014;
+        let w4 = cos(p.x * 5.2 + p.y * 4.1 - time * 4.0) * 0.008;
+
+        // Wave normal derivatives (SEUS Gerstner surface gradient)
+        let dw_dx = (0.95 * cos(p.x * 0.95 + p.y * 0.65 + time * 1.4) * 0.035)
+                  - (1.85 * sin(p.x * 1.85 - p.y * 1.35 + time * 2.1) * 0.022)
+                  - (3.4 * cos(-p.x * 3.4 + p.y * 2.7 + time * 3.2) * 0.014)
+                  - (5.2 * sin(p.x * 5.2 + p.y * 4.1 - time * 4.0) * 0.008);
+        let dw_dz = (0.65 * cos(p.x * 0.95 + p.y * 0.65 + time * 1.4) * 0.035)
+                  + (1.35 * sin(p.x * 1.85 - p.y * 1.35 + time * 2.1) * 0.022)
+                  + (2.7 * cos(-p.x * 3.4 + p.y * 2.7 + time * 3.2) * 0.014)
+                  - (4.1 * sin(p.x * 5.2 + p.y * 4.1 - time * 4.0) * 0.008);
+
+        let wave_n = normalize(vec3<f32>(-dw_dx * 2.2, 1.0, -dw_dz * 2.2));
+        let water_N = normalize(mix(N, wave_n, 0.65));
 
         let water_ndotl = max(dot(water_N, L), 0.0);
         let water_ndotv = max(dot(water_N, V), 0.001);
         let water_H = normalize(V + L);
         let water_ndoth = max(dot(water_N, water_H), 0.0);
 
-        // Crystal azure to deep navy depth gradient
-        let shallow_water = vec3<f32>(0.10, 0.55, 0.72);
-        let deep_water = vec3<f32>(0.02, 0.16, 0.38);
-        let water_base = mix(shallow_water, deep_water, 0.55);
+        // SEUS physical absorption and scattering
+        let shallow_water = vec3<f32>(0.12, 0.68, 0.78);
+        let deep_water = vec3<f32>(0.02, 0.14, 0.36);
+        let water_base = mix(shallow_water, deep_water, 0.45);
 
-        // Physical Fresnel equation for water (Schlick approximation)
-        let fresnel = pow(clamp(1.0 - water_ndotv, 0.0, 1.0), 3.5);
-        let sky_refl = mix(scene.ambient_sky.rgb * 1.35, scene.sun_color.rgb, 0.28);
+        // Physical Schlick Fresnel reflection
+        let fresnel = pow(clamp(1.0 - water_ndotv, 0.0, 1.0), 3.8);
+        let sky_refl = mix(scene.ambient_sky.rgb * 1.6, scene.sun_color.rgb, 0.32);
 
-        // Sunlight specular glimmer with sharp highlight
-        let spec_power = pow(water_ndoth, 128.0) * 2.8 * shadow_factor;
-        let water_sun = sun_light * water_ndotl * shadow_factor;
+        // SEUS microfacet specular glint
+        let spec_power = pow(water_ndoth, 196.0) * 3.6 * shadow_factor;
+        let water_direct = direct_light * water_ndotl * shadow_factor;
 
-        // Animated caustic light dispersion on the surface
-        let caustic = pow(sin(wp.x * 3.5 + time * 1.8) * sin(wp.y * 3.5 - time * 1.8) * 0.5 + 0.5, 3.0) * 0.08;
+        // Dynamic underwater caustics
+        let caustic = pow(sin(p.x * 3.2 + time * 1.6) * sin(p.y * 3.2 - time * 1.6) * 0.5 + 0.5, 3.5) * 0.09;
 
-        let final_water = mix(water_base * (ambient * 0.90 + water_sun * 0.80 + caustic), sky_refl, fresnel * 0.76)
+        let final_water = mix(water_base * (ambient * 0.95 + water_direct * 0.85 + caustic), sky_refl, fresnel * 0.82)
                         + scene.sun_color.rgb * spec_power;
 
         lit_color = final_water;
     } else if (shading_model == 3u) {
         // --- 1. Emissive (Lamps, glowing ores, torches, lava) ---
-        lit_color = albedo * 1.35 + scene.sun_color.rgb * 0.15;
+        lit_color = albedo * 1.45 + scene.sun_color.rgb * 0.15;
     } else if (shading_model == 1u) {
         // --- 2. Stylized / Cel (Unturned style) ---
         var band = 0.30;
@@ -231,12 +236,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         } else if (lit_val > 0.15) {
             band = 0.65;
         }
-        let stylized_direct = albedo * sun_light * band;
+        let stylized_direct = albedo * direct_light * band;
         let stylized_ambient = albedo * (ambient * 0.85 + vec3<f32>(0.10));
         let rim = pow(1.0 - ndotv, 3.0) * 0.20;
-        lit_color = (stylized_ambient + stylized_direct + scene.ambient_sky.rgb * rim) * face_weight * ao_val;
+        lit_color = (stylized_ambient + stylized_direct + scene.ambient_sky.rgb * rim) * ao_val;
     } else {
-        // --- 3. Standard PBR & Foliage ---
+        // --- 3. Standard PBR & Foliage (FastPBR & Vintage Story physical lighting) ---
         let F0 = mix(vec3<f32>(0.04), albedo, metallic);
         let F = F0 + (vec3<f32>(1.0) - F0) * pow(clamp(1.0 - vdoth, 0.0, 1.0), 5.0);
 
@@ -261,28 +266,34 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             foliage_trans = albedo * scene.sun_color.rgb * sss * shadow_factor;
         }
 
-        let direct = (diffuse + specular) * sun_light * ndotl * shadow_factor + foliage_trans;
-        let rim = pow(1.0 - ndotv, 4.0) * (1.0 - roughness) * 0.20;
+        // Physical directional light with soft wrap for organic voxel edges
+        let ndotl_wrap = max((dot(N, L) + 0.12) / 1.12, 0.0);
+        let direct = (diffuse * ndotl_wrap + specular * ndotl) * direct_light * shadow_factor + foliage_trans;
+        let rim = pow(1.0 - ndotv, 4.0) * (1.0 - roughness) * 0.18;
         let ambient_term = albedo * (ambient + scene.ambient_sky.rgb * rim);
 
-        lit_color = (ambient_term + direct) * face_weight * ao_val;
+        lit_color = (ambient_term + direct) * ao_val;
     }
 
-    // Atmospheric distance fog (clean near-field, quadratic falloff to horizon)
+    // Insanity Shader Cinematic Exponential Fog with atmospheric forward-scattering
     let dist = distance(in.world_pos, scene.camera_pos.xyz);
-    let fog_start = scene.camera_pos.w * 0.55;
-    let fog_end = scene.camera_pos.w;
-    let fog_linear = clamp((dist - fog_start) / max(fog_end - fog_start, 1.0), 0.0, 1.0);
-    let fog_factor = fog_linear * fog_linear;
+    let fog_range = max(scene.camera_pos.w, 16.0);
+    let fog_dist_norm = dist / fog_range;
+    let fog_factor = clamp(1.0 - exp(-2.2 * pow(fog_dist_norm, 1.25)), 0.0, 1.0);
+
+    let V_frag = normalize(scene.camera_pos.xyz - in.world_pos);
+    let vol = max(dot(-V_frag, L), 0.0);
+    let forward_glow = pow(vol, 6.0) * 0.28 * scene.sun_dir.w;
+    let fog_color_scattered = scene.fog_color.rgb + scene.sun_color.rgb * forward_glow;
 
     let brightness = scene.fog_color.w;
     let lit_exposed = lit_color * brightness;
-    let fogged_color = mix(lit_exposed, scene.fog_color.rgb * brightness, fog_factor);
+    let fogged_color = mix(lit_exposed, fog_color_scattered * brightness, fog_factor);
 
     var out_alpha = 1.0;
     if (shading_model == 4u) {
-        let fresnel_a = pow(clamp(1.0 - max(dot(N, V), 0.001), 0.0, 1.0), 2.5);
-        out_alpha = mix(0.72, 0.95, fresnel_a);
+        let fresnel_a = pow(clamp(1.0 - max(dot(N, V), 0.001), 0.0, 1.0), 3.0);
+        out_alpha = mix(0.62, 0.94, fresnel_a);
     }
 
     return vec4<f32>(tonemap_filmic(fogged_color), out_alpha);
@@ -354,14 +365,15 @@ fn fs_sky(in: SkyVertexOutput) -> @location(0) vec4<f32> {
     // Sun alignment cos(theta)
     let cos_sun = dot(V, S);
 
-    // 1. Sun disc (sharp, dazzling core)
+    // 1. Sun disc (sharp, dazzling core, visible during the day)
+    let day_fade = clamp(sun_elevation * 4.0, 0.0, 1.0);
     let sun_disc_cos = 0.9992;
     let sun_edge = smoothstep(sun_disc_cos - 0.0004, sun_disc_cos + 0.0001, cos_sun);
-    let sun_core = scene.sun_color.rgb * (sun_edge * 14.0 * scene.sun_dir.w);
+    let sun_core = scene.sun_color.rgb * (sun_edge * 14.0 * scene.sun_dir.w * day_fade);
 
     // 2. Solar corona / Mie scattering halo around the sun
-    let corona_wide = pow(max(cos_sun, 0.0), 10.0) * (scene.sun_color.rgb * 0.55 * scene.sun_dir.w);
-    let corona_tight = pow(max(cos_sun, 0.0), 80.0) * (scene.sun_color.rgb * 1.6 * scene.sun_dir.w);
+    let corona_wide = pow(max(cos_sun, 0.0), 10.0) * (scene.sun_color.rgb * 0.55 * scene.sun_dir.w * day_fade);
+    let corona_tight = pow(max(cos_sun, 0.0), 80.0) * (scene.sun_color.rgb * 1.6 * scene.sun_dir.w * day_fade);
     let sun_glow = corona_wide + corona_tight;
 
     // 3. Moon disc and halo at night (in opposite direction -S)
@@ -369,20 +381,48 @@ fn fs_sky(in: SkyVertexOutput) -> @location(0) vec4<f32> {
     let cos_moon = dot(V, M);
     let moon_disc_cos = 0.9994;
     let moon_edge = smoothstep(moon_disc_cos - 0.0002, moon_disc_cos + 0.0001, cos_moon);
-    let moon_color = vec3<f32>(0.70, 0.82, 0.98);
+    let moon_color = vec3<f32>(0.72, 0.84, 0.98);
     let night_fade = clamp(-sun_elevation * 3.5, 0.0, 1.0);
     let moon_core = moon_color * (moon_edge * 5.0 * night_fade);
     let moon_glow = pow(max(cos_moon, 0.0), 28.0) * (moon_color * 0.40 * night_fade);
 
-    // 4. Subtle procedural night stars
+    // 4. FastPBR celestial starfield & Milky Way
     var stars = vec3<f32>(0.0);
-    if (sun_elevation < 0.02 && V.y > 0.04) {
-        let star_seed = floor(V * 320.0);
-        let star_hash = fract(sin(dot(star_seed, vec3<f32>(12.9898, 78.233, 45.164))) * 43758.5453);
-        if (star_hash > 0.994) {
-            let star_bright = (star_hash - 0.994) / 0.006;
-            stars = vec3<f32>(star_bright * 1.6 * clamp(-sun_elevation * 4.0, 0.0, 1.0));
+    if (night_fade > 0.01 && V.y > 0.01) {
+        let time = scene.sky_zenith.w;
+        let plane = V.xz / (V.y + length(V.xz) * 0.66);
+        let rot = time * 0.010;
+        let s_rot = sin(rot);
+        let c_rot = cos(rot);
+        let rot_plane = vec2<f32>(plane.x * c_rot - plane.y * s_rot, plane.x * s_rot + plane.y * c_rot);
+
+        let uv1 = floor(rot_plane * 520.0) / 520.0;
+        let uv2 = floor(rot_plane * 240.0) / 240.0;
+
+        let h1 = fract(sin(dot(uv1, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+        let h2 = fract(sin(dot(uv1 + vec2<f32>(0.13, 0.37), vec2<f32>(93.185, 49.321))) * 23421.631);
+        let h3 = fract(sin(dot(uv2, vec2<f32>(41.139, 17.583))) * 57234.129);
+
+        let blue_star = vec3<f32>(0.65, 0.82, 1.0);
+        let warm_star = vec3<f32>(1.0, 0.78, 0.58);
+        let star_col = mix(blue_star, warm_star, h2);
+
+        var star_val = 0.0;
+        if (h1 > 0.982) {
+            star_val = (h1 - 0.982) / 0.018 * 1.8;
         }
+        if (h3 > 0.992) {
+            star_val = star_val + (h3 - 0.992) / 0.008 * 3.2;
+        }
+
+        let twinkle = sin(time * 3.5 + h1 * 40.0) * 0.18 + 0.82;
+
+        // Soft Milky Way band
+        let milky_coord = rot_plane.x * 0.6 + rot_plane.y * 0.8;
+        let milky_way = exp(-milky_coord * milky_coord * 0.8) * 0.12 * clamp(V.y * 2.0, 0.0, 1.0);
+        let milky_col = vec3<f32>(0.55, 0.65, 0.85) * milky_way;
+
+        stars = (star_col * star_val * twinkle + milky_col) * night_fade * smoothstep(0.02, 0.18, V.y);
     }
 
     let raw_sky = sky_dome + sun_glow + sun_core + moon_glow + moon_core + stars;

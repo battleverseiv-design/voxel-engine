@@ -769,13 +769,13 @@ impl Renderer {
         let view_proj = camera.view_proj(aspect);
         let inv_view_proj = view_proj.inverse();
 
-        // Directional Light Projection for dynamic cascaded shadows
+        // Directional Light Projection for dynamic cascaded shadows (Sun by day, Moon by night)
         let shadow_range = 95.0_f32;
         let sun_dir_norm = environment.sun_dir.normalize();
-        let light_dir = if environment.sun_intensity > 0.05 {
-            sun_dir_norm
+        let light_dir = if sun_dir_norm.y > -0.05 {
+            Vec3::new(sun_dir_norm.x, sun_dir_norm.y.max(0.08), sun_dir_norm.z).normalize()
         } else {
-            -sun_dir_norm
+            Vec3::new(-sun_dir_norm.x, (-sun_dir_norm.y).max(0.12), -sun_dir_norm.z).normalize()
         };
 
         let shadow_texel = (shadow_range * 2.0) / 2048.0;

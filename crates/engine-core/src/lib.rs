@@ -877,22 +877,17 @@ impl EnvironmentProvider for StandardEnvironment {
         // Actual continuous sun direction across the entire 24h orbit
         let actual_sun_dir = Vec3::new(sun_azimuth * 0.70, sun_elevation, 0.45).normalize();
 
-        let is_day = sun_elevation >= -0.06;
-        let primary_light_dir = if is_day {
-            Vec3::new(actual_sun_dir.x, actual_sun_dir.y.max(0.04), actual_sun_dir.z).normalize()
-        } else {
-            Vec3::new(-actual_sun_dir.x, (-actual_sun_dir.y).max(0.04), -actual_sun_dir.z).normalize()
-        };
-
+        let is_day = sun_elevation >= -0.05;
         let day_factor = (sun_elevation * 3.5).clamp(0.0, 1.0);
         let sunset_factor =
             (1.0 - (sun_elevation.abs() * 5.0).min(1.0)) * (1.0 - day_factor * 0.35);
 
-        let day_zenith = [0.16, 0.38, 0.82];
-        let day_horizon = [0.65, 0.78, 0.92];
-        let night_zenith = [0.015, 0.025, 0.055];
-        let night_horizon = [0.035, 0.055, 0.10];
-        let sunset_color = [0.96, 0.46, 0.18];
+        // FastPBR & Insanity atmospheric color palettes
+        let day_zenith = [0.14, 0.34, 0.80];
+        let day_horizon = [0.62, 0.74, 0.88];
+        let night_zenith = [0.008, 0.014, 0.032];
+        let night_horizon = [0.018, 0.026, 0.048];
+        let sunset_color = [0.98, 0.48, 0.16];
 
         let lerp3 = |a: [f32; 3], b: [f32; 3], t: f32| -> [f32; 3] {
             [
@@ -905,21 +900,22 @@ impl EnvironmentProvider for StandardEnvironment {
         let mut zenith = lerp3(night_zenith, day_zenith, day_factor);
         let mut horizon = lerp3(night_horizon, day_horizon, day_factor);
         horizon = lerp3(horizon, sunset_color, sunset_factor * 0.85);
-        zenith = lerp3(zenith, [0.42, 0.22, 0.36], sunset_factor * 0.45);
+        zenith = lerp3(zenith, [0.38, 0.20, 0.35], sunset_factor * 0.45);
 
+        // FastPBR sun and moon illuminance
         let (sun_color, sun_intensity) = if is_day {
-            let col = lerp3(sunset_color, [1.0, 0.95, 0.86], day_factor);
-            (col, 0.12 + 0.78 * day_factor)
+            let col = lerp3(sunset_color, [1.0, 0.975, 0.955], day_factor);
+            (col, 0.15 + 0.85 * day_factor)
         } else {
-            ([0.45, 0.58, 0.85], 0.12)
+            ([0.68, 0.78, 0.98], 0.12)
         };
 
         EnvironmentState {
-            sun_dir: primary_light_dir,
+            sun_dir: actual_sun_dir,
             sun_color,
             sun_intensity,
-            ambient_sky: lerp3([0.02, 0.03, 0.06], [0.22, 0.30, 0.42], day_factor),
-            ambient_ground: lerp3([0.01, 0.01, 0.02], [0.10, 0.09, 0.07], day_factor),
+            ambient_sky: lerp3([0.012, 0.018, 0.038], [0.26, 0.36, 0.48], day_factor),
+            ambient_ground: lerp3([0.006, 0.007, 0.010], [0.10, 0.11, 0.09], day_factor),
             fog_color: horizon,
             fog_density: 1.0,
             sky_zenith: zenith,

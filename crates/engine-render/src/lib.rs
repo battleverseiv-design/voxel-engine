@@ -1,7 +1,7 @@
 mod avatar;
 pub mod textures;
 
-pub use avatar::{build_avatar_mesh, build_first_person_arm_mesh};
+pub use avatar::{build_avatar_mesh, build_first_person_arm_mesh, push_textured_box};
 
 use std::collections::HashMap;
 use std::sync::Arc;

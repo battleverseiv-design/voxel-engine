@@ -122,6 +122,108 @@ fn push_box(
     }
 }
 
+pub fn push_textured_box(
+    out: &mut Vec<VoxelVertex>,
+    center: Vec3,
+    half_size: Vec3,
+    rot: Mat3,
+    colors: [[f32; 3]; 6],
+    textures: [u16; 6],
+) {
+    let dx = half_size.x;
+    let dy = half_size.y;
+    let dz = half_size.z;
+
+    let faces: [(Vec3, [Vec3; 4]); 6] = [
+        (
+            Vec3::Y,
+            [
+                Vec3::new(-dx, dy, -dz),
+                Vec3::new(-dx, dy, dz),
+                Vec3::new(dx, dy, dz),
+                Vec3::new(dx, dy, -dz),
+            ],
+        ),
+        (
+            Vec3::NEG_Y,
+            [
+                Vec3::new(-dx, -dy, dz),
+                Vec3::new(-dx, -dy, -dz),
+                Vec3::new(dx, -dy, -dz),
+                Vec3::new(dx, -dy, dz),
+            ],
+        ),
+        (
+            Vec3::NEG_Z,
+            [
+                Vec3::new(dx, dy, -dz),
+                Vec3::new(dx, -dy, -dz),
+                Vec3::new(-dx, -dy, -dz),
+                Vec3::new(-dx, dy, -dz),
+            ],
+        ),
+        (
+            Vec3::Z,
+            [
+                Vec3::new(-dx, dy, dz),
+                Vec3::new(-dx, -dy, dz),
+                Vec3::new(dx, -dy, dz),
+                Vec3::new(dx, dy, dz),
+            ],
+        ),
+        (
+            Vec3::X,
+            [
+                Vec3::new(dx, dy, dz),
+                Vec3::new(dx, -dy, dz),
+                Vec3::new(dx, -dy, -dz),
+                Vec3::new(dx, dy, -dz),
+            ],
+        ),
+        (
+            Vec3::NEG_X,
+            [
+                Vec3::new(-dx, dy, -dz),
+                Vec3::new(-dx, -dy, -dz),
+                Vec3::new(-dx, -dy, dz),
+                Vec3::new(-dx, dy, dz),
+            ],
+        ),
+    ];
+
+    let quad_uvs = [
+        [0.0, 0.0],
+        [0.0, 1.0],
+        [1.0, 1.0],
+        [1.0, 0.0],
+    ];
+
+    for (face_idx, (local_norm, corners)) in faces.iter().enumerate() {
+        let world_norm = (rot * (*local_norm)).normalize();
+        let c = [
+            center + rot * corners[0],
+            center + rot * corners[1],
+            center + rot * corners[2],
+            center + rot * corners[3],
+        ];
+        let color = colors[face_idx];
+        let tex_id = textures[face_idx] as u32;
+
+        let tri = [0, 1, 2, 0, 2, 3];
+        for &idx in &tri {
+            out.push(VoxelVertex {
+                position: c[idx].to_array(),
+                normal: world_norm.to_array(),
+                color,
+                ao: 1.0,
+                uv: quad_uvs[idx],
+                tex_id,
+                material_params: [0.85, 0.0, 1.0, 0.0],
+            });
+        }
+    }
+}
+
 /// Builds dynamic stylized survivor avatar mesh (Variant 2: Unturned II / Hytale / Project Zomboid).
 /// Features articulated limbs with elbows and knees, boots with soles/toes, V-shaped torso, neck, and volumetric 3D hair strands.
 pub fn build_avatar_mesh(
@@ -137,6 +239,7 @@ pub fn build_avatar_mesh(
     is_swimming: bool,
     arm_swing: f32,
     held_block_colors: Option<[[f32; 3]; 6]>,
+    held_block_textures: Option<[u16; 6]>,
 ) -> Vec<VoxelVertex> {
     let mut vertices = Vec::with_capacity(650);
 
@@ -603,13 +706,24 @@ pub fn build_avatar_mesh(
 
     if let Some(block_colors) = held_block_colors {
         let block_pos = r_hand_center + r_fore_rot * Vec3::new(0.0, -0.04, -0.08);
-        push_box(
-            &mut vertices,
-            block_pos,
-            Vec3::splat(0.085),
-            r_fore_rot,
-            block_colors,
-        );
+        if let Some(textures) = held_block_textures {
+            push_textured_box(
+                &mut vertices,
+                block_pos,
+                Vec3::splat(0.085),
+                r_fore_rot,
+                block_colors,
+                textures,
+            );
+        } else {
+            push_box(
+                &mut vertices,
+                block_pos,
+                Vec3::splat(0.085),
+                r_fore_rot,
+                block_colors,
+            );
+        }
     }
 
     // Left Arm
@@ -669,6 +783,7 @@ pub fn build_first_person_arm_mesh(
     swing_progress: f32,
     sway_offset: Vec3,
     held_block_colors: Option<[[f32; 3]; 6]>,
+    held_block_textures: Option<[u16; 6]>,
 ) -> Vec<VoxelVertex> {
     let mut vertices = Vec::with_capacity(160);
 
@@ -772,13 +887,24 @@ pub fn build_first_person_arm_mesh(
     if let Some(block_colors) = held_block_colors {
         let block_pos = fist_center + arm_fwd * 0.06 + arm_rot * Vec3::new(0.0, 0.04, 0.0);
         let block_rot = arm_rot * Mat3::from_rotation_y(0.35) * Mat3::from_rotation_x(-0.25);
-        push_box(
-            &mut vertices,
-            block_pos,
-            Vec3::splat(0.06),
-            block_rot,
-            block_colors,
-        );
+        if let Some(textures) = held_block_textures {
+            push_textured_box(
+                &mut vertices,
+                block_pos,
+                Vec3::splat(0.06),
+                block_rot,
+                block_colors,
+                textures,
+            );
+        } else {
+            push_box(
+                &mut vertices,
+                block_pos,
+                Vec3::splat(0.06),
+                block_rot,
+                block_colors,
+            );
+        }
     }
 
     vertices

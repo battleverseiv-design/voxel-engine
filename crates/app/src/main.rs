@@ -17,13 +17,15 @@ use engine_net::{
     ClientEvent, DiscoveryBeacon, DiscoveryScanner, GameClient, HostEvent,
     Packet, RemotePlayer, ServerHost, DEFAULT_PORT,
 };
-use engine_render::{build_avatar_mesh, build_first_person_arm_mesh, Camera, RenderError, Renderer};
+use engine_render::{
+    build_avatar_mesh, build_first_person_arm_mesh, push_textured_box, Camera, RenderError, Renderer,
+};
 use engine_world::{
     world_to_chunk, CharacterController, ControllerInput, StepType,
     VoxelContraption, World, WorldStreamer, CHUNK_SIZE_I32,
 };
 use game_survival::{LithosphereWorldGen, SurvivalMode};
-use glam::{IVec3, Vec3};
+use glam::{IVec3, Mat3, Vec3};
 use settings::{keycode_to_name, name_to_keycode, Settings};
 use world_manager::{WorldManager, WorldMeta};
 use winit::application::ApplicationHandler;
@@ -225,6 +227,101 @@ struct EngineApp {
     host_status_msg: Option<(String, bool)>,
     join_tab: JoinTab,
     join_password_input: String,
+    dropped_items: Vec<DroppedItem>,
+    next_dropped_item_id: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DroppedItem {
+    pub id: u64,
+    pub position: Vec3,
+    pub velocity: Vec3,
+    pub block_id: BlockId,
+    pub count: u32,
+    pub age: f32,
+    pub pickup_delay: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum SlotAction {
+    LeftClick(usize),
+    RightClick(usize),
+    ShiftClick(usize),
+}
+
+fn render_block_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    size: f32,
+    block_id: BlockId,
+    registry: &BlockRegistry,
+) {
+    let def = registry.get(block_id);
+    let top_col = def
+        .map(|d| {
+            let c = d.face_colors[0];
+            egui::Color32::from_rgb(
+                (c[0] * 255.0) as u8,
+                (c[1] * 255.0) as u8,
+                (c[2] * 255.0) as u8,
+            )
+        })
+        .unwrap_or(egui::Color32::GRAY);
+
+    let left_col = def
+        .map(|d| {
+            let c = d.face_colors[4];
+            egui::Color32::from_rgb(
+                (c[0] * 205.0) as u8,
+                (c[1] * 205.0) as u8,
+                (c[2] * 205.0) as u8,
+            )
+        })
+        .unwrap_or(egui::Color32::DARK_GRAY);
+
+    let right_col = def
+        .map(|d| {
+            let c = d.face_colors[3];
+            egui::Color32::from_rgb(
+                (c[0] * 160.0) as u8,
+                (c[1] * 160.0) as u8,
+                (c[2] * 160.0) as u8,
+            )
+        })
+        .unwrap_or(egui::Color32::BLACK);
+
+    let rx = size * 0.50;
+    let ry = size * 0.28;
+    let h = size * 0.48;
+
+    let p_top = center - egui::vec2(0.0, ry + h * 0.45);
+    let p_top_right = center + egui::vec2(rx, -h * 0.45);
+    let p_top_left = center + egui::vec2(-rx, -h * 0.45);
+    let p_mid = center + egui::vec2(0.0, ry - h * 0.45);
+    let p_bot = center + egui::vec2(0.0, ry + h * 0.55);
+    let p_bot_right = center + egui::vec2(rx, h * 0.55);
+    let p_bot_left = center + egui::vec2(-rx, h * 0.55);
+
+    // 1. Top face (isometric rhombus)
+    painter.add(egui::epaint::Shape::convex_polygon(
+        vec![p_top, p_top_right, p_mid, p_top_left],
+        top_col,
+        egui::Stroke::new(0.5_f32, egui::Color32::from_black_alpha(75)),
+    ));
+
+    // 2. Left face (isometric parallelogram)
+    painter.add(egui::epaint::Shape::convex_polygon(
+        vec![p_top_left, p_mid, p_bot, p_bot_left],
+        left_col,
+        egui::Stroke::new(0.5_f32, egui::Color32::from_black_alpha(75)),
+    ));
+
+    // 3. Right face (isometric parallelogram)
+    painter.add(egui::epaint::Shape::convex_polygon(
+        vec![p_mid, p_top_right, p_bot_right, p_bot],
+        right_col,
+        egui::Stroke::new(0.5_f32, egui::Color32::from_black_alpha(75)),
+    ));
 }
 
 fn render_inventory_slot(
@@ -233,55 +330,144 @@ fn render_inventory_slot(
     slot: Option<ItemStack>,
     is_active: bool,
     registry: &BlockRegistry,
-    clicked: &mut Option<usize>,
+    action: &mut Option<SlotAction>,
 ) {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(38.0, 38.0), egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::click());
     if response.clicked() {
-        *clicked = Some(slot_idx);
+        let shift = ui.input(|i| i.modifiers.shift);
+        if shift {
+            *action = Some(SlotAction::ShiftClick(slot_idx));
+        } else {
+            *action = Some(SlotAction::LeftClick(slot_idx));
+        }
+    } else if response.secondary_clicked() {
+        *action = Some(SlotAction::RightClick(slot_idx));
     }
 
     let is_hovered = response.hovered();
     let bg_color = if is_active {
-        egui::Color32::from_rgb(50, 75, 110)
+        egui::Color32::from_rgb(52, 78, 115)
     } else if is_hovered {
-        egui::Color32::from_rgb(45, 52, 65)
+        egui::Color32::from_rgb(46, 54, 68)
     } else {
-        egui::Color32::from_rgb(26, 30, 38)
+        egui::Color32::from_rgb(24, 28, 36)
     };
 
     let border_stroke = if is_active {
-        egui::Stroke::new(2.0_f32, egui::Color32::WHITE)
+        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 225, 120))
     } else if is_hovered {
-        egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(140, 175, 220))
+        egui::Stroke::new(1.8_f32, egui::Color32::from_rgb(150, 185, 235))
     } else {
-        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(60, 70, 85))
+        egui::Stroke::new(1.2_f32, egui::Color32::from_rgb(55, 65, 80))
     };
 
-    ui.painter().rect_filled(rect, 4.0, bg_color);
-    ui.painter().rect_stroke(rect, 4.0, border_stroke, egui::StrokeKind::Inside);
+    ui.painter().rect_filled(rect, 5.0, bg_color);
+    ui.painter().rect_stroke(rect, 5.0, border_stroke, egui::StrokeKind::Inside);
 
     if let Some(stack) = slot {
-        let def = registry.get(stack.block_id);
-        let block_color = def
-            .map(|d| egui::Color32::from_rgb(d.icon_color[0], d.icon_color[1], d.icon_color[2]))
-            .unwrap_or(egui::Color32::GRAY);
-
-        let icon_rect = egui::Rect::from_center_size(rect.center() - egui::vec2(0.0, 2.0), egui::vec2(18.0, 18.0));
-        ui.painter().rect_filled(icon_rect, 2.0, block_color);
+        render_block_icon(
+            ui.painter(),
+            rect.center() - egui::vec2(0.0, 1.0),
+            22.0,
+            stack.block_id,
+            registry,
+        );
 
         let count_text = format!("{}", stack.count);
+        let text_pos = rect.max - egui::vec2(4.0, 3.0);
         ui.painter().text(
-            rect.max - egui::vec2(3.0, 2.0),
+            text_pos + egui::vec2(1.0, 1.0),
             egui::Align2::RIGHT_BOTTOM,
-            count_text,
-            egui::FontId::proportional(11.0),
+            &count_text,
+            egui::FontId::proportional(12.0),
+            egui::Color32::BLACK,
+        );
+        ui.painter().text(
+            text_pos,
+            egui::Align2::RIGHT_BOTTOM,
+            &count_text,
+            egui::FontId::proportional(12.0),
             egui::Color32::WHITE,
         );
 
-        let name = def
-            .map(|d| d.name.split(':').last().unwrap_or(&d.name))
-            .unwrap_or("блок");
-        response.on_hover_text(format!("{} (x{})", name, stack.count));
+        if let Some(def) = registry.get(stack.block_id) {
+            let name = def.name.split(':').last().unwrap_or(&def.name);
+            response.on_hover_ui(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(name).strong().color(egui::Color32::WHITE));
+                    ui.label(
+                        egui::RichText::new(format!("x{}", stack.count))
+                            .color(egui::Color32::from_rgb(255, 215, 120)),
+                    );
+                });
+            });
+        }
+    }
+}
+
+fn render_hud_hotbar_slot(
+    ui: &mut egui::Ui,
+    slot_idx: usize,
+    slot: Option<ItemStack>,
+    is_active: bool,
+    registry: &BlockRegistry,
+) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
+
+    let bg_color = if is_active {
+        egui::Color32::from_rgba_unmultiplied(65, 95, 140, 215)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(20, 24, 32, 195)
+    };
+
+    let border_stroke = if is_active {
+        egui::Stroke::new(2.5_f32, egui::Color32::from_rgb(255, 230, 140))
+    } else {
+        egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(45))
+    };
+
+    ui.painter().rect_filled(rect, 6.0, bg_color);
+    ui.painter().rect_stroke(rect, 6.0, border_stroke, egui::StrokeKind::Inside);
+
+    ui.painter().text(
+        rect.min + egui::vec2(4.0, 3.0),
+        egui::Align2::LEFT_TOP,
+        format!("{}", slot_idx + 1),
+        egui::FontId::proportional(10.0),
+        if is_active {
+            egui::Color32::WHITE
+        } else {
+            egui::Color32::from_white_alpha(120)
+        },
+    );
+
+    if let Some(stack) = slot {
+        render_block_icon(
+            ui.painter(),
+            rect.center() + egui::vec2(0.0, 1.0),
+            22.0,
+            stack.block_id,
+            registry,
+        );
+
+        if stack.count > 1 {
+            let count_text = format!("{}", stack.count);
+            let text_pos = rect.max - egui::vec2(4.0, 3.0);
+            ui.painter().text(
+                text_pos + egui::vec2(1.0, 1.0),
+                egui::Align2::RIGHT_BOTTOM,
+                &count_text,
+                egui::FontId::proportional(12.0),
+                egui::Color32::BLACK,
+            );
+            ui.painter().text(
+                text_pos,
+                egui::Align2::RIGHT_BOTTOM,
+                &count_text,
+                egui::FontId::proportional(12.0),
+                egui::Color32::WHITE,
+            );
+        }
     }
 }
 
@@ -459,6 +645,8 @@ impl EngineApp {
             host_status_msg: None,
             join_tab: JoinTab::Lan,
             join_password_input: String::new(),
+            dropped_items: Vec::new(),
+            next_dropped_item_id: 1,
         };
 
         app.push_chat(
@@ -554,6 +742,23 @@ impl EngineApp {
         self.controller.velocity = Vec3::ZERO;
         self.camera.position = feet + Vec3::Y * (self.controller.config.standing_height * 0.90);
         self.player_pos = feet;
+    }
+
+    fn spawn_dropped_item(&mut self, block_id: BlockId, count: u32, pos: Vec3, vel: Vec3) {
+        if block_id == BlockId::AIR || count == 0 {
+            return;
+        }
+        let id = self.next_dropped_item_id;
+        self.next_dropped_item_id = self.next_dropped_item_id.wrapping_add(1);
+        self.dropped_items.push(DroppedItem {
+            id,
+            position: pos,
+            velocity: vel,
+            block_id,
+            count,
+            age: 0.0,
+            pickup_delay: 0.5,
+        });
     }
 
     fn set_cursor_lock(&mut self, lock: bool) {
@@ -1239,7 +1444,10 @@ impl EngineApp {
                     if self.break_progress >= 1.0 {
                         self.apply_and_broadcast_block(hit.hit_pos, BlockId::AIR);
                         audio::play_block_break(&block_name, Some(hit.hit_pos.as_vec3()));
-                        self.inventory.add_item(hit.block, 1);
+                        let drop_pos = hit.hit_pos.as_vec3() + Vec3::new(0.5, 0.4, 0.5);
+                        let rnd_x = ((self.time_of_day * 133.0).sin()) * 1.2;
+                        let rnd_z = ((self.time_of_day * 277.0).cos()) * 1.2;
+                        self.spawn_dropped_item(hit.block, 1, drop_pos, Vec3::new(rnd_x, 2.8, rnd_z));
                         self.break_target = None;
                         self.break_progress = 0.0;
                         let local_meshes = self.world.rebuild_dirty_meshes(&self.registry, 8);
@@ -1263,6 +1471,62 @@ impl EngineApp {
         } else {
             self.break_target = None;
             self.break_progress = 0.0;
+        }
+
+        // Update dropped items in world (physics, magnetic pull, pickup)
+        if self.screen == MenuScreen::Playing {
+            let player_feet = self.player_feet();
+            let player_center = player_feet + Vec3::new(0.0, 0.9, 0.0);
+            let mut picked_up_any = false;
+
+            self.dropped_items.retain_mut(|item| {
+                item.age += dt;
+                if item.pickup_delay > 0.0 {
+                    item.pickup_delay -= dt;
+                }
+
+                // Gravity & simple voxel collision
+                item.velocity.y -= 14.0 * dt;
+                let next_pos = item.position + item.velocity * dt;
+                let check_block = next_pos.floor().as_ivec3();
+                let block = self.world.get_block(check_block);
+                let is_solid = self.registry.is_solid(block);
+
+                if is_solid {
+                    item.velocity.y = 0.0;
+                    item.velocity.x *= 0.60;
+                    item.velocity.z *= 0.60;
+                    let ground_y = check_block.y as f32 + 1.05;
+                    if item.position.y < ground_y {
+                        item.position.y = ground_y;
+                    }
+                } else {
+                    item.position = next_pos;
+                }
+
+                // Magnetic attraction and pickup
+                let dist = item.position.distance(player_center);
+                if item.pickup_delay <= 0.0 && dist < 2.0 {
+                    let dir = (player_center - item.position).normalize();
+                    item.position += dir * (7.5 * dt);
+
+                    if dist < 0.65 {
+                        let excess = self.inventory.add_item(item.block_id, item.count);
+                        if excess == 0 {
+                            picked_up_any = true;
+                            return false; // Despawn item
+                        } else {
+                            item.count = excess;
+                        }
+                    }
+                }
+
+                item.age < 300.0 // 5 minute despawn
+            });
+
+            if picked_up_any {
+                audio::play_event_at("item.pickup", player_center);
+            }
         }
 
         audio::set_listener(self.camera.position, self.camera.forward(), self.camera.right_xz());
@@ -1816,7 +2080,7 @@ impl EngineApp {
         let mut quit_requested = false;
         let mut settings_changed = false;
         let mut submit_chat_requested = false;
-        let mut slot_clicked: Option<usize> = None;
+        let mut slot_action: Option<SlotAction> = None;
         let mut close_inventory_requested = false;
         let mut creative_pick_block: Option<BlockId> = None;
         let mut clear_inventory_requested = false;
@@ -2076,81 +2340,48 @@ impl EngineApp {
                     .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -14.0))
                     .interactable(false)
                     .show(ctx, |ui| {
-                        egui::Frame::NONE
-                            .fill(egui::Color32::from_black_alpha(150))
-                            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(50)))
-                            .corner_radius(6.0)
-                            .inner_margin(egui::Margin::symmetric(8, 6))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    for idx in 0..9 {
-                                        let is_sel = idx == selected_slot;
-                                        let slot = inventory_slots[idx];
-                                        let (id, count) = slot.map(|s| (s.block_id, s.count)).unwrap_or((BlockId::AIR, 0));
-                                        let def = registry.get(id);
-                                        let color = def
-                                            .map(|d| {
-                                                let c = d.face_colors[0];
-                                                egui::Color32::from_rgb(
-                                                    (c[0] * 255.0) as u8,
-                                                    (c[1] * 255.0) as u8,
-                                                    (c[2] * 255.0) as u8,
-                                                )
-                                            })
-                                            .unwrap_or(egui::Color32::DARK_GRAY);
+                        ui.vertical_centered(|ui| {
+                            // Selected block name floating above the hotbar
+                            if let Some(stack) = inventory_slots[selected_slot] {
+                                if let Some(def) = registry.get(stack.block_id) {
+                                    let name = def.name.split(':').last().unwrap_or(&def.name);
+                                    egui::Frame::NONE
+                                        .fill(egui::Color32::from_black_alpha(175))
+                                        .corner_radius(4.0)
+                                        .inner_margin(egui::Margin::symmetric(10, 3))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                egui::RichText::new(name)
+                                                    .color(egui::Color32::WHITE)
+                                                    .size(13.0)
+                                                    .strong(),
+                                            );
+                                        });
+                                    ui.add_space(4.0);
+                                }
+                            }
 
-                                        let name = def
-                                            .map(|d| d.name.split(':').last().unwrap_or(&d.name))
-                                            .unwrap_or("---");
-
-                                        let border = if is_sel {
-                                            egui::Stroke::new(2.0_f32, egui::Color32::WHITE)
-                                        } else {
-                                            egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(40))
-                                        };
-
-                                        egui::Frame::NONE
-                                            .fill(if is_sel {
-                                                egui::Color32::from_white_alpha(50)
-                                            } else {
-                                                egui::Color32::from_black_alpha(80)
-                                            })
-                                            .stroke(border)
-                                            .corner_radius(4.0)
-                                            .inner_margin(egui::Margin::symmetric(6, 4))
-                                            .show(ui, |ui| {
-                                                ui.horizontal(|ui| {
-                                                    let (rect, _) = ui.allocate_exact_size(
-                                                        egui::vec2(16.0, 16.0),
-                                                        egui::Sense::hover(),
-                                                    );
-                                                    if count > 0 {
-                                                        ui.painter().rect_filled(rect, 2.0, color);
-                                                    } else {
-                                                        ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::DARK_GRAY), egui::StrokeKind::Inside);
-                                                    }
-                                                    let label_text = if count > 0 {
-                                                        format!("{}: {} x{}", idx + 1, name, count)
-                                                    } else {
-                                                        format!("{}: ---", idx + 1)
-                                                    };
-                                                    ui.label(
-                                                        egui::RichText::new(label_text)
-                                                            .size(12.0)
-                                                            .color(if is_sel {
-                                                                egui::Color32::WHITE
-                                                            } else if count > 0 {
-                                                                egui::Color32::LIGHT_GRAY
-                                                            } else {
-                                                                egui::Color32::GRAY
-                                                            }),
-                                                    );
-                                                });
-                                            });
-                                        ui.add_space(2.0);
-                                    }
+                            egui::Frame::NONE
+                                .fill(egui::Color32::from_black_alpha(165))
+                                .stroke(egui::Stroke::new(1.5_f32, egui::Color32::from_white_alpha(45)))
+                                .corner_radius(8.0)
+                                .inner_margin(egui::Margin::same(6))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing = egui::vec2(5.0, 0.0);
+                                        for idx in 0..9 {
+                                            let is_sel = idx == selected_slot;
+                                            render_hud_hotbar_slot(
+                                                ui,
+                                                idx,
+                                                inventory_slots[idx],
+                                                is_sel,
+                                                &registry,
+                                            );
+                                        }
+                                    });
                                 });
-                            });
+                        });
                     });
             }
 
@@ -3334,37 +3565,42 @@ impl EngineApp {
                                     egui::Grid::new("creative_palette_grid")
                                         .spacing([6.0, 6.0])
                                         .show(ui, |ui| {
-                                            for (idx, (id, name, color)) in blocks.iter().enumerate() {
+                                            for (idx, (id, name, _color)) in blocks.iter().enumerate() {
                                                 let (rect, resp) = ui.allocate_exact_size(
-                                                    egui::vec2(38.0, 38.0),
+                                                    egui::vec2(44.0, 44.0),
                                                     egui::Sense::click(),
                                                 );
                                                 let is_hov = resp.hovered();
                                                 ui.painter().rect_filled(
                                                     rect,
-                                                    4.0,
+                                                    6.0,
                                                     if is_hov {
-                                                        egui::Color32::from_white_alpha(50)
+                                                        egui::Color32::from_rgb(46, 54, 68)
                                                     } else {
-                                                        egui::Color32::from_black_alpha(100)
+                                                        egui::Color32::from_rgb(24, 28, 36)
                                                     },
                                                 );
                                                 ui.painter().rect_stroke(
                                                     rect,
-                                                    4.0,
+                                                    6.0,
                                                     egui::Stroke::new(
                                                         1.0_f32,
                                                         if is_hov {
                                                             egui::Color32::WHITE
                                                         } else {
-                                                            egui::Color32::from_white_alpha(40)
+                                                            egui::Color32::from_white_alpha(45)
                                                         },
                                                     ),
                                                     egui::StrokeKind::Inside,
                                                 );
 
-                                                let inner = rect.shrink(6.0);
-                                                ui.painter().rect_filled(inner, 2.0, *color);
+                                                render_block_icon(
+                                                    ui.painter(),
+                                                    rect.center(),
+                                                    22.0,
+                                                    *id,
+                                                    &registry,
+                                                );
 
                                                 let resp = resp.on_hover_text(name);
                                                 if resp.clicked() {
@@ -3398,7 +3634,7 @@ impl EngineApp {
                                         slot,
                                         is_active,
                                         &registry,
-                                        &mut slot_clicked,
+                                        &mut slot_action,
                                     );
                                 }
                             });
@@ -3456,7 +3692,7 @@ impl EngineApp {
                                             slot,
                                             false,
                                             &registry,
-                                            &mut slot_clicked,
+                                            &mut slot_action,
                                         );
                                     }
                                 });
@@ -3479,7 +3715,7 @@ impl EngineApp {
                                         slot,
                                         is_active,
                                         &registry,
-                                        &mut slot_clicked,
+                                        &mut slot_action,
                                     );
                                 }
                             });
@@ -3504,39 +3740,157 @@ impl EngineApp {
                         });
                 }
             }
-        }
-);
 
-        if let Some(idx) = slot_clicked {
-            match (self.held_stack.take(), self.inventory.slots[idx]) {
-                (None, Some(slot_item)) => {
-                    self.held_stack = Some(slot_item);
-                    self.inventory.slots[idx] = None;
-                }
-                (Some(held), None) => {
-                    self.inventory.slots[idx] = Some(held);
-                }
-                (Some(held), Some(slot_item)) => {
-                    if held.block_id == slot_item.block_id {
-                        let space = ItemStack::MAX_STACK - slot_item.count;
-                        let to_add = held.count.min(space);
-                        self.inventory.slots[idx] = Some(ItemStack {
-                            block_id: slot_item.block_id,
-                            count: slot_item.count + to_add,
-                        });
-                        let rem = held.count - to_add;
-                        if rem > 0 {
-                            self.held_stack = Some(ItemStack {
-                                block_id: held.block_id,
-                                count: rem,
-                            });
-                        }
-                    } else {
-                        self.held_stack = Some(slot_item);
-                        self.inventory.slots[idx] = Some(held);
+            // Floating held item cursor in inventory
+            if inventory_open {
+                if let Some(held) = held_stack {
+                    if let Some(mouse_pos) = ctx.pointer_latest_pos() {
+                        let painter = ctx.layer_painter(egui::LayerId::new(
+                            egui::Order::Tooltip,
+                            egui::Id::new("floating_held_item"),
+                        ));
+                        render_block_icon(&painter, mouse_pos, 28.0, held.block_id, &registry);
+                        let count_text = format!("{}", held.count);
+                        let text_pos = mouse_pos + egui::vec2(12.0, 10.0);
+                        painter.text(
+                            text_pos + egui::vec2(1.0, 1.0),
+                            egui::Align2::LEFT_BOTTOM,
+                            &count_text,
+                            egui::FontId::proportional(13.0),
+                            egui::Color32::BLACK,
+                        );
+                        painter.text(
+                            text_pos,
+                            egui::Align2::LEFT_BOTTOM,
+                            &count_text,
+                            egui::FontId::proportional(13.0),
+                            egui::Color32::WHITE,
+                        );
                     }
                 }
-                (None, None) => {}
+            }
+        });
+
+        if let Some(action) = slot_action {
+            match action {
+                SlotAction::LeftClick(idx) => {
+                    match (self.held_stack.take(), self.inventory.slots[idx]) {
+                        (None, Some(slot_item)) => {
+                            self.held_stack = Some(slot_item);
+                            self.inventory.slots[idx] = None;
+                        }
+                        (Some(held), None) => {
+                            self.inventory.slots[idx] = Some(held);
+                        }
+                        (Some(held), Some(slot_item)) => {
+                            if held.block_id == slot_item.block_id {
+                                let space = ItemStack::MAX_STACK.saturating_sub(slot_item.count);
+                                let to_add = held.count.min(space);
+                                self.inventory.slots[idx] = Some(ItemStack {
+                                    block_id: slot_item.block_id,
+                                    count: slot_item.count + to_add,
+                                });
+                                let rem = held.count - to_add;
+                                if rem > 0 {
+                                    self.held_stack = Some(ItemStack {
+                                        block_id: held.block_id,
+                                        count: rem,
+                                    });
+                                }
+                            } else {
+                                self.held_stack = Some(slot_item);
+                                self.inventory.slots[idx] = Some(held);
+                            }
+                        }
+                        (None, None) => {}
+                    }
+                }
+                SlotAction::RightClick(idx) => {
+                    match (self.held_stack.take(), self.inventory.slots[idx]) {
+                        (None, Some(slot_item)) => {
+                            // Split stack: take half in hand, leave rest in slot
+                            let take_count = (slot_item.count + 1) / 2;
+                            let rem = slot_item.count - take_count;
+                            self.held_stack = Some(ItemStack {
+                                block_id: slot_item.block_id,
+                                count: take_count,
+                            });
+                            if rem > 0 {
+                                self.inventory.slots[idx] = Some(ItemStack {
+                                    block_id: slot_item.block_id,
+                                    count: rem,
+                                });
+                            } else {
+                                self.inventory.slots[idx] = None;
+                            }
+                        }
+                        (Some(mut held), None) => {
+                            // Place 1 item from hand into empty slot
+                            self.inventory.slots[idx] = Some(ItemStack {
+                                block_id: held.block_id,
+                                count: 1,
+                            });
+                            if held.count > 1 {
+                                held.count -= 1;
+                                self.held_stack = Some(held);
+                            }
+                        }
+                        (Some(mut held), Some(mut slot_item)) => {
+                            if held.block_id == slot_item.block_id {
+                                if slot_item.count < ItemStack::MAX_STACK {
+                                    slot_item.count += 1;
+                                    self.inventory.slots[idx] = Some(slot_item);
+                                    if held.count > 1 {
+                                        held.count -= 1;
+                                        self.held_stack = Some(held);
+                                    }
+                                } else {
+                                    self.held_stack = Some(held);
+                                }
+                            } else {
+                                // Swap different items
+                                self.held_stack = Some(slot_item);
+                                self.inventory.slots[idx] = Some(held);
+                            }
+                        }
+                        (None, None) => {}
+                    }
+                }
+                SlotAction::ShiftClick(idx) => {
+                    // Quick move: hotbar (0..9) <-> backpack (9..36)
+                    if let Some(mut item) = self.inventory.slots[idx] {
+                        let target_range = if idx < 9 { 9..36 } else { 0..9 };
+                        // 1. Try to merge into existing stacks
+                        for t_idx in target_range.clone() {
+                            if let Some(t_item) = &mut self.inventory.slots[t_idx] {
+                                if t_item.block_id == item.block_id && t_item.count < ItemStack::MAX_STACK {
+                                    let space = ItemStack::MAX_STACK - t_item.count;
+                                    let to_add = item.count.min(space);
+                                    t_item.count += to_add;
+                                    item.count -= to_add;
+                                    if item.count == 0 {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        // 2. Put remainder into first empty slot in target range
+                        if item.count > 0 {
+                            for t_idx in target_range {
+                                if self.inventory.slots[t_idx].is_none() {
+                                    self.inventory.slots[t_idx] = Some(item);
+                                    item.count = 0;
+                                    break;
+                                }
+                            }
+                        }
+                        if item.count == 0 {
+                            self.inventory.slots[idx] = None;
+                        } else {
+                            self.inventory.slots[idx] = Some(item);
+                        }
+                    }
+                }
             }
         }
 
@@ -4439,6 +4793,24 @@ impl ApplicationHandler for EngineApp {
                                     self.inventory.selected_hotbar = slot;
                                 }
 
+                                // Drop held item on Q
+                                if code == KeyCode::KeyQ && !event.repeat {
+                                    let sel = self.inventory.selected_hotbar;
+                                    if let Some(slot) = &mut self.inventory.slots[sel] {
+                                        let drop_block = slot.block_id;
+                                        if slot.count <= 1 {
+                                            self.inventory.slots[sel] = None;
+                                        } else {
+                                            slot.count -= 1;
+                                        }
+                                        let fwd = self.camera.forward();
+                                        let drop_pos = self.camera.position + fwd * 0.6;
+                                        let drop_vel = fwd * 4.8 + Vec3::new(0.0, 1.8, 0.0);
+                                        self.spawn_dropped_item(drop_block, 1, drop_pos, drop_vel);
+                                        audio::play_event_at("item.drop", drop_pos);
+                                    }
+                                }
+
                                 // Double-space in creative mode toggles flying
                                 if name_to_keycode(&self.settings.keybinds.jump_up) == Some(code) {
                                     self.jump_just_pressed = true;
@@ -4607,15 +4979,17 @@ impl ApplicationHandler for EngineApp {
                     && self.screen != MenuScreen::HostServer
                     && self.screen != MenuScreen::JoinServer
                 {
-                    let held_colors = if let Some(item) = self.inventory.selected_item() {
+                    let held_visuals = if let Some(item) = self.inventory.selected_item() {
                         if item.block_id != BlockId::AIR {
-                            self.registry.get(item.block_id).map(|d| d.face_colors)
+                            self.registry.get(item.block_id).map(|d| (d.face_colors, d.face_textures))
                         } else {
                             None
                         }
                     } else {
                         None
                     };
+                    let held_colors = held_visuals.map(|(c, _)| c);
+                    let held_textures = held_visuals.map(|(_, t)| t);
 
                     if self.perspective != CameraPerspective::FirstPerson {
                         let horiz_speed = Vec3::new(self.velocity.x, 0.0, self.velocity.z).length();
@@ -4632,6 +5006,7 @@ impl ApplicationHandler for EngineApp {
                             self.controller.in_water,
                             self.arm_swing_progress,
                             held_colors,
+                            held_textures,
                         );
                         all_avatar_verts.extend(verts);
                     } else {
@@ -4646,6 +5021,7 @@ impl ApplicationHandler for EngineApp {
                             self.arm_swing_progress,
                             self.hand_sway,
                             held_colors,
+                            held_textures,
                         );
                         all_avatar_verts.extend(verts);
                     }
@@ -4661,13 +5037,15 @@ impl ApplicationHandler for EngineApp {
                 };
 
                 for remote in &remote_players {
-                    let held_colors = if remote.held_block != 0 {
+                    let remote_visuals = if remote.held_block != 0 {
                         self.registry
                             .get(BlockId(remote.held_block))
-                            .map(|d| d.face_colors)
+                            .map(|d| (d.face_colors, d.face_textures))
                     } else {
                         None
                     };
+                    let remote_colors = remote_visuals.map(|(c, _)| c);
+                    let remote_textures = remote_visuals.map(|(_, t)| t);
                     let is_dead = remote.health <= 0.0;
                     let render_pos = if is_dead {
                         remote.current_pos - Vec3::new(0.0, 0.75, 0.0)
@@ -4691,7 +5069,8 @@ impl ApplicationHandler for EngineApp {
                         false,
                         false,
                         if is_dead { 0.0 } else { remote.arm_swing },
-                        if is_dead { None } else { held_colors },
+                        if is_dead { None } else { remote_colors },
+                        if is_dead { None } else { remote_textures },
                     );
                     if remote.hurt_timer > 0.0 || is_dead {
                         for v in &mut verts {
@@ -4701,6 +5080,25 @@ impl ApplicationHandler for EngineApp {
                         }
                     }
                     all_avatar_verts.extend(verts);
+                }
+
+                // Render dropped items in world
+                for item in &self.dropped_items {
+                    if let Some(def) = self.registry.get(item.block_id) {
+                        let bob = (item.age * 3.0).sin() * 0.05;
+                        let rot_angle = item.age * 2.0;
+                        let rot = Mat3::from_rotation_y(rot_angle);
+                        let center = item.position + Vec3::new(0.0, 0.15 + bob, 0.0);
+                        let half_size = Vec3::splat(0.12);
+                        push_textured_box(
+                            &mut all_avatar_verts,
+                            center,
+                            half_size,
+                            rot,
+                            def.face_colors,
+                            def.face_textures,
+                        );
+                    }
                 }
 
                 // ===== [TEMPORARY PHYSICS TEST: START] =====

@@ -63,7 +63,7 @@ fn fbm_clouds(p: vec2<f32>) -> f32 {
 }
 
 fn calculate_shadow(world_pos: vec3<f32>, normal: vec3<f32>) -> f32 {
-    let bias_pos = world_pos + normal * 0.04;
+    let bias_pos = world_pos + normal * 0.15;
     let light_clip = scene.light_view_proj * vec4<f32>(bias_pos, 1.0);
     let shadow_ndc = light_clip.xyz / light_clip.w;
 
@@ -135,7 +135,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var albedo = in.color;
     if (in.tex_id > 0u) {
         let tex_col = textureSample(t_atlas, s_atlas, in.uv, in.tex_id - 1u);
-        if (tex_col.a < 0.1) {
+        if (tex_col.a < 0.5) {
             discard;
         }
         albedo = albedo * tex_col.rgb;
@@ -275,15 +275,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         lit_color = (ambient_term + direct) * ao_val;
     }
 
-    // Insanity Shader Cinematic Exponential Fog with atmospheric forward-scattering
+    // Distance fog: crystal clear near-field, gentle smooth horizon fade
     let dist = distance(in.world_pos, scene.camera_pos.xyz);
-    let fog_range = max(scene.camera_pos.w, 16.0);
-    let fog_dist_norm = dist / fog_range;
-    let fog_factor = clamp(1.0 - exp(-2.2 * pow(fog_dist_norm, 1.25)), 0.0, 1.0);
+    let fog_max = max(scene.camera_pos.w, 32.0);
+    let fog_start = fog_max * 0.65;
+    let fog_linear = clamp((dist - fog_start) / max(fog_max - fog_start, 1.0), 0.0, 1.0);
+    let fog_factor = smoothstep(0.0, 1.0, fog_linear);
 
     let V_frag = normalize(scene.camera_pos.xyz - in.world_pos);
     let vol = max(dot(-V_frag, L), 0.0);
-    let forward_glow = pow(vol, 6.0) * 0.28 * scene.sun_dir.w;
+    let forward_glow = pow(vol, 6.0) * 0.20 * scene.sun_dir.w;
     let fog_color_scattered = scene.fog_color.rgb + scene.sun_color.rgb * forward_glow;
 
     let brightness = scene.fog_color.w;
@@ -304,6 +305,7 @@ struct ShadowVertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) @interpolate(flat) tex_id: u32,
+    @location(2) @interpolate(flat) shading_model: u32,
 };
 
 @vertex
@@ -312,14 +314,19 @@ fn vs_shadow(in: VertexInput) -> ShadowVertexOutput {
     out.clip_position = scene.light_view_proj * vec4<f32>(in.position, 1.0);
     out.uv = in.uv;
     out.tex_id = in.tex_id;
+    out.shading_model = u32(round(in.material_params.z));
     return out;
 }
 
 @fragment
 fn fs_shadow(in: ShadowVertexOutput) {
+    // Transparent water does not write to shadow map!
+    if (in.shading_model == 4u) {
+        discard;
+    }
     if (in.tex_id > 0u) {
         let tex_col = textureSample(t_atlas, s_atlas, in.uv, in.tex_id - 1u);
-        if (tex_col.a < 0.25) {
+        if (tex_col.a < 0.5) {
             discard;
         }
     }
@@ -376,53 +383,63 @@ fn fs_sky(in: SkyVertexOutput) -> @location(0) vec4<f32> {
     let corona_tight = pow(max(cos_sun, 0.0), 80.0) * (scene.sun_color.rgb * 1.6 * scene.sun_dir.w * day_fade);
     let sun_glow = corona_wide + corona_tight;
 
-    // 3. Moon disc and halo at night (in opposite direction -S)
+    // 3. Crescent Moon at night (in opposite direction -S)
     let M = -S;
-    let cos_moon = dot(V, M);
-    let moon_disc_cos = 0.9994;
-    let moon_edge = smoothstep(moon_disc_cos - 0.0002, moon_disc_cos + 0.0001, cos_moon);
-    let moon_color = vec3<f32>(0.72, 0.84, 0.98);
     let night_fade = clamp(-sun_elevation * 3.5, 0.0, 1.0);
-    let moon_core = moon_color * (moon_edge * 5.0 * night_fade);
-    let moon_glow = pow(max(cos_moon, 0.0), 28.0) * (moon_color * 0.40 * night_fade);
+    let moon_color = vec3<f32>(0.85, 0.90, 1.0);
+    var moon_core = vec3<f32>(0.0);
+    var moon_glow = vec3<f32>(0.0);
 
-    // 4. FastPBR celestial starfield & Milky Way
+    if (night_fade > 0.001) {
+        let up = vec3<f32>(0.0, 1.0, 0.0);
+        let m_right = normalize(cross(up, M));
+        let m_up = cross(M, m_right);
+        let dx = dot(V, m_right);
+        let dy = dot(V, m_up);
+        let R = 0.038;
+        let r2 = (dx * dx + dy * dy) / (R * R);
+
+        if (r2 < 1.0) {
+            let nx = dx / R;
+            let ny = dy / R;
+            let shadow_dx = nx - 0.42;
+            let shadow_dy = ny - 0.05;
+            let shadow_r2 = shadow_dx * shadow_dx + shadow_dy * shadow_dy;
+            
+            let crescent_edge = smoothstep(1.0, 0.94, r2);
+            let is_lit = smoothstep(0.68, 0.78, shadow_r2);
+            
+            let bright_crescent = is_lit * crescent_edge * 10.0;
+            let earthshine = (1.0 - is_lit) * crescent_edge * 0.03;
+            moon_core = moon_color * ((bright_crescent + earthshine) * night_fade);
+        }
+
+        let cos_moon = dot(V, M);
+        moon_glow = pow(max(cos_moon, 0.0), 42.0) * (moon_color * 0.20 * night_fade);
+    }
+
+    // 4. Calm, elegant celestial starfield
     var stars = vec3<f32>(0.0);
-    if (night_fade > 0.01 && V.y > 0.01) {
+    if (night_fade > 0.01 && V.y > 0.02) {
         let time = scene.sky_zenith.w;
         let plane = V.xz / (V.y + length(V.xz) * 0.66);
-        let rot = time * 0.010;
+        let rot = time * 0.0005;
         let s_rot = sin(rot);
         let c_rot = cos(rot);
         let rot_plane = vec2<f32>(plane.x * c_rot - plane.y * s_rot, plane.x * s_rot + plane.y * c_rot);
 
-        let uv1 = floor(rot_plane * 520.0) / 520.0;
-        let uv2 = floor(rot_plane * 240.0) / 240.0;
-
+        let uv1 = floor(rot_plane * 440.0) / 440.0;
         let h1 = fract(sin(dot(uv1, vec2<f32>(12.9898, 78.233))) * 43758.5453);
         let h2 = fract(sin(dot(uv1 + vec2<f32>(0.13, 0.37), vec2<f32>(93.185, 49.321))) * 23421.631);
-        let h3 = fract(sin(dot(uv2, vec2<f32>(41.139, 17.583))) * 57234.129);
 
-        let blue_star = vec3<f32>(0.65, 0.82, 1.0);
-        let warm_star = vec3<f32>(1.0, 0.78, 0.58);
-        let star_col = mix(blue_star, warm_star, h2);
-
-        var star_val = 0.0;
-        if (h1 > 0.982) {
-            star_val = (h1 - 0.982) / 0.018 * 1.8;
+        if (h1 > 0.9955) {
+            let blue_star = vec3<f32>(0.72, 0.85, 1.0);
+            let warm_star = vec3<f32>(1.0, 0.82, 0.65);
+            let star_col = mix(blue_star, warm_star, h2);
+            let star_bright = (h1 - 0.9955) / 0.0045 * 2.2;
+            let twinkle = sin(time * 2.5 + h1 * 30.0) * 0.15 + 0.85;
+            stars = star_col * star_bright * twinkle * night_fade * smoothstep(0.04, 0.20, V.y);
         }
-        if (h3 > 0.992) {
-            star_val = star_val + (h3 - 0.992) / 0.008 * 3.2;
-        }
-
-        let twinkle = sin(time * 3.5 + h1 * 40.0) * 0.18 + 0.82;
-
-        // Soft Milky Way band
-        let milky_coord = rot_plane.x * 0.6 + rot_plane.y * 0.8;
-        let milky_way = exp(-milky_coord * milky_coord * 0.8) * 0.12 * clamp(V.y * 2.0, 0.0, 1.0);
-        let milky_col = vec3<f32>(0.55, 0.65, 0.85) * milky_way;
-
-        stars = (star_col * star_val * twinkle + milky_col) * night_fade * smoothstep(0.02, 0.18, V.y);
     }
 
     let raw_sky = sky_dome + sun_glow + sun_core + moon_glow + moon_core + stars;
@@ -452,7 +469,7 @@ fn fs_sky(in: SkyVertexOutput) -> @location(0) vec4<f32> {
             let day_top = vec3<f32>(1.0, 0.99, 0.98);
             let day_bottom = vec3<f32>(0.72, 0.77, 0.88);
             let sunset_col = vec3<f32>(1.0, 0.58, 0.36);
-            let night_col = vec3<f32>(0.12, 0.16, 0.26);
+            let night_col = vec3<f32>(0.005, 0.008, 0.015);
 
             var base_cloud = mix(night_col, mix(day_bottom, day_top, sun_shading), day_factor);
             base_cloud = mix(base_cloud, sunset_col, sunset_factor * 0.70);

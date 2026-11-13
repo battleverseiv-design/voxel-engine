@@ -18,6 +18,8 @@ pub enum SoundEffect {
     FootstepSand,
     FootstepGravel,
     FootstepLeaves,
+    WaterSwim,
+    WaterSplash,
     Jump,
     BlockBreak,
     BlockPlace,
@@ -237,6 +239,20 @@ fn register_default_sounds(engine: &AudioEngine) {
         0.95,
         36.0,
     );
+    engine.register_simple_event(
+        "player.swim",
+        SoundCategory::Sfx,
+        &["swim_1.wav", "swim_2.wav"],
+        0.75,
+        28.0,
+    );
+    engine.register_simple_event(
+        "player.splash",
+        SoundCategory::Sfx,
+        &["splash_1.wav", "splash_2.wav"],
+        0.85,
+        32.0,
+    );
 
     // 5. Ambient Loops (from AmbientSounds mod)
     engine.register_simple_event(
@@ -379,6 +395,8 @@ pub fn play_sound(effect: SoundEffect) {
         SoundEffect::FootstepSand => play_event("footstep.sand", None),
         SoundEffect::FootstepGravel => play_event("footstep.gravel", None),
         SoundEffect::FootstepLeaves => play_event("footstep.leaves", None),
+        SoundEffect::WaterSwim => play_event("player.swim", None),
+        SoundEffect::WaterSplash => play_event("player.splash", None),
         SoundEffect::Jump => play_event("player.jump", None),
         SoundEffect::BlockBreak => play_event("block.break", None),
         SoundEffect::BlockPlace => play_event("block.place", None),

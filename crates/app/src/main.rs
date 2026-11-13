@@ -1295,7 +1295,8 @@ impl EngineApp {
             // Handle step sounds
             if let Some(step) = out.step_event {
                 let effect = match step {
-                    StepType::WaterSwim | StepType::WaterSplash => audio::SoundEffect::Footstep,
+                    StepType::WaterSwim => audio::SoundEffect::WaterSwim,
+                    StepType::WaterSplash => audio::SoundEffect::WaterSplash,
                     StepType::Footstep(block_id) => {
                         if let Some(def) = self.registry.get(block_id) {
                             let name = def.name.to_lowercase();

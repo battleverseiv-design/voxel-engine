@@ -11,7 +11,7 @@ use std::time::Instant;
 use engine_core::{
     AvatarModel, BlockId, BlockRegistry, CommandHost, CommandRegistry, EnvironmentProvider,
     GameMode, Inventory, ItemStack, MaterialRegistry, PlayerMode, ReferenceFrameId,
-    RelativeTransform, WorldGenerator,
+    RelativeTransform, ServerHostProfile, WorldGenerator,
 };
 use engine_net::{
     ClientEvent, DiscoveryBeacon, DiscoveryScanner, GameClient, HostEvent,
@@ -34,14 +34,38 @@ const PLAYER_HEIGHT: f32 = 1.75;
 const PLAYER_EYE_HEIGHT: f32 = 1.55;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionType {
+    /// Pure offline singleplayer. Simulation fully freezes on Pause (ESC).
+    Solo,
+    /// Player hosts a co-op server. Simulation never freezes on Pause (ESC); admin panel active.
+    Host,
+    /// Player joined a remote host server.
+    Client,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostConfigTab {
+    Network,
+    Sandbox,
+    World,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinTab {
+    Lan,
+    Direct,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MenuScreen {
     Title,
     SelectWorld,
     CreateWorld,
+    HostServer,
+    JoinServer,
     Playing,
     Pause,
     Settings,
-    Multiplayer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -187,6 +211,15 @@ struct EngineApp {
     // ===== [TEMPORARY PHYSICS TEST: START] =====
     test_physics_blocks: Vec<VoxelContraption>,
     // ===== [TEMPORARY PHYSICS TEST: END] =====
+    session_type: SessionType,
+    server_profiles: Vec<(String, ServerHostProfile)>,
+    selected_server_profile_idx: usize,
+    active_host_profile: ServerHostProfile,
+    host_profile_name_input: String,
+    host_active_tab: HostConfigTab,
+    host_status_msg: Option<(String, bool)>,
+    join_tab: JoinTab,
+    join_password_input: String,
 }
 
 fn render_inventory_slot(
@@ -268,6 +301,12 @@ impl EngineApp {
         let spawn = mode.spawn_position();
 
         let mut cached_world_list = WorldManager::list_worlds();
+        let server_profiles = WorldManager::list_server_profiles();
+        let (host_profile_name_input, active_host_profile) = if let Some((name, prof)) = server_profiles.first() {
+            (name.clone(), prof.clone())
+        } else {
+            ("Default Co-op".to_string(), ServerHostProfile::default())
+        };
         if cached_world_list.is_empty() {
             let gen = LithosphereWorldGen::new(42, &registry);
             let (sy, _) = gen.surface_height(0, 0);
@@ -403,6 +442,15 @@ impl EngineApp {
             // ===== [TEMPORARY PHYSICS TEST: START] =====
             test_physics_blocks: Vec::new(),
             // ===== [TEMPORARY PHYSICS TEST: END] =====
+            session_type: SessionType::Solo,
+            server_profiles,
+            selected_server_profile_idx: 0,
+            active_host_profile,
+            host_profile_name_input,
+            host_active_tab: HostConfigTab::Network,
+            host_status_msg: None,
+            join_tab: JoinTab::Lan,
+            join_password_input: String::new(),
         };
 
         app.push_chat(
@@ -884,11 +932,20 @@ impl EngineApp {
 
     fn update(&mut self, dt: f32) {
         let dt = dt.min(0.05);
+
+        // In offline Solo mode, Pause (ESC) genuinely freezes the entire simulation!
+        let is_solo_paused = self.screen == MenuScreen::Pause && self.session_type == SessionType::Solo;
+        if is_solo_paused {
+            return;
+        }
+
         self.time_of_day = (self.time_of_day + self.time_speed * dt).rem_euclid(24.0);
 
         if self.screen == MenuScreen::Title
             || self.screen == MenuScreen::SelectWorld
             || self.screen == MenuScreen::CreateWorld
+            || self.screen == MenuScreen::HostServer
+            || self.screen == MenuScreen::JoinServer
         {
             self.panorama_angle += dt * 0.08;
             let radius = 18.0;
@@ -1495,6 +1552,25 @@ impl EngineApp {
                             }
                         }
                     }
+                    ClientEvent::HostHandshakeReceived { server_name, experience_id, sandbox } => {
+                        let pvp_str = if sandbox.pvp_enabled { "Вкл" } else { "Выкл" };
+                        self.push_chat(
+                            format!("[Сервер '{server_name}'] Режим: {experience_id}, PvP: {pvp_str}, Гравитация: {:.1}x", sandbox.gravity_multiplier),
+                            egui::Color32::from_rgb(100, 220, 255),
+                        );
+                    }
+                    ClientEvent::RulesUpdated(sandbox) => {
+                        let pvp_str = if sandbox.pvp_enabled { "Вкл" } else { "Выкл" };
+                        self.push_chat(
+                            format!("[Правила сервера обновлены] PvP: {pvp_str}, Гравитация: {:.1}x", sandbox.gravity_multiplier),
+                            egui::Color32::from_rgb(255, 200, 100),
+                        );
+                    }
+                    ClientEvent::Teleported(pos) => {
+                        self.set_player_feet(Vec3::from_array(pos));
+                        self.velocity = Vec3::ZERO;
+                        self.push_chat("[Хост] Вы были телепортированы хостом сервера!", egui::Color32::YELLOW);
+                    }
                     ClientEvent::Disconnected => {
                         client_disconnected = true;
                         self.net_status = Some((
@@ -1503,6 +1579,15 @@ impl EngineApp {
                             Instant::now(),
                         ));
                         self.push_chat("[Сеть] Отключено от сервера", egui::Color32::RED);
+                    }
+                    ClientEvent::DisconnectedWithReason(reason) => {
+                        client_disconnected = true;
+                        self.net_status = Some((
+                            format!("Отключен от сервера: {reason}"),
+                            egui::Color32::RED,
+                            Instant::now(),
+                        ));
+                        self.push_chat(format!("[Сеть] Отключен: {reason}"), egui::Color32::RED);
                     }
                 }
             }
@@ -1697,11 +1782,21 @@ impl EngineApp {
         let mut back_to_title_requested = false;
         let mut resume_requested = false;
         let mut open_settings_requested = false;
-        let mut open_multiplayer_requested = false;
-        let mut start_server_requested = false;
-        let mut stop_server_requested = false;
+        let open_multiplayer_requested = false;
+        let mut open_host_server_requested = false;
+        let mut open_join_server_requested = false;
+        let mut start_host_session_requested = false;
+        let mut save_host_profile_requested = false;
+        let mut delete_host_profile_requested = false;
+        let mut new_host_profile_requested = false;
+        let mut kick_client_requested: Option<u32> = None;
+        let mut teleport_client_to_host_requested: Option<u32> = None;
+        let mut apply_live_rules_requested = false;
+        let mut connect_to_server_requested: Option<(SocketAddr, Option<String>)> = None;
+        let start_server_requested = false;
+        let stop_server_requested = false;
         let mut connect_requested = false;
-        let mut disconnect_client_requested = false;
+        let disconnect_client_requested = false;
         let mut back_to_pause_requested = false;
         let mut reset_settings_requested = false;
         let mut quit_requested = false;
@@ -1712,7 +1807,7 @@ impl EngineApp {
         let mut creative_pick_block: Option<BlockId> = None;
         let mut clear_inventory_requested = false;
         let mut respawn_requested = false;
-        let mut tp_to_player_requested: Option<(String, Vec3)> = None;
+        let tp_to_player_requested: Option<(String, Vec3)> = None;
 
         let _mode_id = self.mode.id();
         let player_mode = self.player_mode;
@@ -2247,8 +2342,8 @@ impl EngineApp {
                                 ui.add_space(20.0);
 
                                 if ui
-                                    .add_sized([220.0, 36.0], egui::Button::new(
-                                        egui::RichText::new("Одиночная игра").size(14.0)
+                                    .add_sized([240.0, 36.0], egui::Button::new(
+                                        egui::RichText::new("Одиночная игра (Solo)").size(14.0)
                                     ))
                                     .clicked()
                                 {
@@ -2257,17 +2352,27 @@ impl EngineApp {
                                 ui.add_space(8.0);
 
                                 if ui
-                                    .add_sized([220.0, 36.0], egui::Button::new(
-                                        egui::RichText::new("Мультиплеер").size(14.0)
+                                    .add_sized([240.0, 36.0], egui::Button::new(
+                                        egui::RichText::new("Создать сервер (Host Co-op)").size(14.0)
                                     ))
                                     .clicked()
                                 {
-                                    open_multiplayer_requested = true;
+                                    open_host_server_requested = true;
                                 }
                                 ui.add_space(8.0);
 
                                 if ui
-                                    .add_sized([220.0, 36.0], egui::Button::new(
+                                    .add_sized([240.0, 36.0], egui::Button::new(
+                                        egui::RichText::new("Сетевая игра (Join Server)").size(14.0)
+                                    ))
+                                    .clicked()
+                                {
+                                    open_join_server_requested = true;
+                                }
+                                ui.add_space(8.0);
+
+                                if ui
+                                    .add_sized([240.0, 36.0], egui::Button::new(
                                         egui::RichText::new("Настройки").size(14.0)
                                     ))
                                     .clicked()
@@ -2277,7 +2382,7 @@ impl EngineApp {
                                 ui.add_space(8.0);
 
                                 if ui
-                                    .add_sized([220.0, 36.0], egui::Button::new(
+                                    .add_sized([240.0, 36.0], egui::Button::new(
                                         egui::RichText::new("Выход").size(14.0)
                                     ))
                                     .clicked()
@@ -2495,6 +2600,13 @@ impl EngineApp {
                         });
                 }
                 MenuScreen::Pause => {
+                    let title_text = match self.session_type {
+                        SessionType::Solo => "ПАУЗА (ОДИНОЧНАЯ ИГРА)",
+                        SessionType::Host => "УПРАВЛЕНИЕ СЕРВЕРОМ (ХОСТ)",
+                        SessionType::Client => "МЕНЮ СЕТЕВОЙ ИГРЫ",
+                    };
+                    let fixed_width = if self.session_type == SessionType::Host { 380.0 } else { 280.0 };
+
                     egui::Window::new("Пауза")
                         .collapsible(false)
                         .resizable(false)
@@ -2502,78 +2614,98 @@ impl EngineApp {
                         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                         .frame(
                             egui::Frame::NONE
-                                .fill(egui::Color32::from_black_alpha(175))
-                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(35)))
+                                .fill(egui::Color32::from_black_alpha(185))
+                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(40)))
                                 .corner_radius(8.0)
-                                .inner_margin(egui::Margin::symmetric(28, 20)),
+                                .inner_margin(egui::Margin::symmetric(24, 18)),
                         )
+                        .fixed_size(egui::vec2(fixed_width, 0.0))
                         .show(ctx, |ui| {
                             ui.vertical_centered(|ui| {
-                                ui.add_space(4.0);
+                                ui.add_space(2.0);
                                 ui.label(
-                                    egui::RichText::new("Меню паузы")
-                                        .size(18.0)
+                                    egui::RichText::new(title_text)
+                                        .size(17.0)
                                         .strong()
                                         .color(egui::Color32::WHITE),
                                 );
-                                ui.add_space(16.0);
+                                if self.session_type == SessionType::Host {
+                                    ui.label(
+                                        egui::RichText::new("Сервер активен в реальном времени (мир не заморожен)")
+                                            .size(11.0)
+                                            .color(egui::Color32::from_rgb(140, 220, 140)),
+                                    );
+                                }
+                                ui.add_space(14.0);
 
                                 if ui
-                                    .add_sized([220.0, 34.0], egui::Button::new("Продолжить"))
+                                    .add_sized([220.0, 34.0], egui::Button::new("Вернуться в игру"))
                                     .clicked()
                                 {
                                     resume_requested = true;
                                 }
                                 ui.add_space(8.0);
-                                if ui
-                                    .add_sized([220.0, 34.0], egui::Button::new("Мультиплеер (LAN / IP)"))
-                                    .clicked()
-                                {
-                                    open_multiplayer_requested = true;
-                                }
 
-                                let remote_list: Vec<(String, Vec3)> = if self.server_host.is_some() {
-                                    self.host_remote_players.values().map(|p| (p.name.clone(), p.current_pos)).collect()
-                                } else if let Some(client) = &self.game_client {
-                                    client.remote_players.values().map(|p| (p.name.clone(), p.current_pos)).collect()
-                                } else {
-                                    Vec::new()
-                                };
-                                if !remote_list.is_empty() {
-                                    ui.add_space(6.0);
-                                    ui.label(egui::RichText::new("Игроки онлайн:").size(12.0).strong().color(egui::Color32::LIGHT_GRAY));
-                                    for (p_name, p_pos) in remote_list {
-                                        ui.horizontal(|ui| {
-                                            ui.label(format!("• {p_name}"));
-                                            if ui.small_button("ТП").clicked() {
-                                                tp_to_player_requested = Some((p_name, p_pos));
-                                            }
-                                        });
+                                if self.session_type == SessionType::Host {
+                                    ui.separator();
+                                    ui.label(egui::RichText::new("Подключенные клиенты:").size(12.0).strong().color(egui::Color32::WHITE));
+                                    ui.add_space(4.0);
+
+                                    let mut has_clients = false;
+                                    if let Some(host) = &self.server_host {
+                                        for client in host.clients() {
+                                            has_clients = true;
+                                            ui.horizontal(|ui| {
+                                                ui.label(format!("• {} (#{})", client.name, client.id));
+                                                if ui.small_button("ТП к хосту").clicked() {
+                                                    teleport_client_to_host_requested = Some(client.id);
+                                                }
+                                                if ui.small_button("Кикнуть").clicked() {
+                                                    kick_client_requested = Some(client.id);
+                                                }
+                                            });
+                                        }
                                     }
+                                    if !has_clients {
+                                        ui.label(egui::RichText::new("Нет других игроков на сервере").size(11.0).color(egui::Color32::GRAY));
+                                    }
+
+                                    ui.add_space(8.0);
+                                    ui.separator();
+                                    ui.label(egui::RichText::new("Настройки песочницы на лету:").size(12.0).strong().color(egui::Color32::WHITE));
+                                    ui.add_space(4.0);
+
+                                    ui.checkbox(&mut self.active_host_profile.sandbox.pvp_enabled, "Включить PvP (урон игрокам)");
+                                    ui.checkbox(&mut self.active_host_profile.sandbox.structural_integrity, "Сопромат построек");
+                                    ui.add(egui::Slider::new(&mut self.active_host_profile.sandbox.gravity_multiplier, 0.1..=3.0).text("Гравитация"));
+
+                                    if ui.add_sized([220.0, 28.0], egui::Button::new("Применить правила для всех")).clicked() {
+                                        apply_live_rules_requested = true;
+                                    }
+                                    ui.add_space(8.0);
+                                    ui.separator();
                                 }
 
-                                ui.add_space(8.0);
                                 if ui
-                                    .add_sized([220.0, 34.0], egui::Button::new("Настройки"))
+                                    .add_sized([220.0, 32.0], egui::Button::new("Настройки"))
                                     .clicked()
                                 {
                                     open_settings_requested = true;
                                 }
                                 ui.add_space(8.0);
+
+                                let exit_label = match self.session_type {
+                                    SessionType::Solo => "Сохранить и выйти в меню",
+                                    SessionType::Host => "Остановить сервер и выйти",
+                                    SessionType::Client => "Отключиться от сервера",
+                                };
+
                                 if ui
-                                    .add_sized([220.0, 34.0], egui::Button::new("Главное меню"))
+                                    .add_sized([220.0, 32.0], egui::Button::new(exit_label))
                                     .clicked()
                                 {
                                     back_to_title_requested = true;
                                 }
-                                ui.add_space(8.0);
-                                if ui
-                                    .add_sized([220.0, 34.0], egui::Button::new("Выйти из игры"))
-                                    .clicked()
-                                {
-                                    quit_requested = true;
-                                }
-                                ui.add_space(4.0);
                             });
                         });
                 }
@@ -2794,38 +2926,231 @@ impl EngineApp {
                             });
                         });
                 }
-                MenuScreen::Multiplayer => {
-                    egui::Window::new("MultiplayerMenu")
+                MenuScreen::HostServer => {
+                    egui::Window::new("HostServerScreen")
                         .collapsible(false)
                         .resizable(false)
                         .title_bar(false)
                         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                         .frame(
                             egui::Frame::NONE
-                                .fill(egui::Color32::from_black_alpha(175))
-                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(35)))
-                                .corner_radius(8.0)
+                                .fill(egui::Color32::from_black_alpha(195))
+                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(45)))
+                                .corner_radius(10.0)
                                 .inner_margin(egui::Margin::symmetric(28, 22)),
                         )
-                        .fixed_size(egui::vec2(380.0, 360.0))
+                        .fixed_size(egui::vec2(520.0, 480.0))
                         .show(ctx, |ui| {
                             ui.vertical_centered(|ui| {
-                                ui.add_space(2.0);
                                 ui.label(
-                                    egui::RichText::new("Мультиплеер")
-                                        .size(18.0)
+                                    egui::RichText::new("СОЗДАТЬ СЕРВЕР (HOST CO-OP)")
+                                        .size(19.0)
                                         .strong()
                                         .color(egui::Color32::WHITE),
                                 );
+                                ui.label(
+                                    egui::RichText::new("Песочница и выделенный сервер для совместной игры")
+                                        .size(11.0)
+                                        .color(egui::Color32::from_white_alpha(140)),
+                                );
+                                ui.add_space(10.0);
                             });
-                            ui.add_space(10.0);
 
-                            if let Some((msg, color, ts)) = &self.net_status {
-                                if ts.elapsed().as_secs() < 8 {
-                                    ui.colored_label(*color, msg);
+                            // Profile selection & management row
+                            ui.horizontal(|ui| {
+                                ui.label("Профиль сервера:");
+                                let cur_name = self.host_profile_name_input.clone();
+                                egui::ComboBox::from_id_salt("host_profile_combo")
+                                    .selected_text(&cur_name)
+                                    .show_ui(ui, |ui| {
+                                        for (i, (p_name, _)) in self.server_profiles.iter().enumerate() {
+                                            if ui.selectable_label(p_name == &cur_name, p_name).clicked() {
+                                                self.selected_server_profile_idx = i;
+                                                self.host_profile_name_input = p_name.clone();
+                                                if let Some(prof) = WorldManager::get_server_profile(p_name) {
+                                                    self.active_host_profile = prof;
+                                                }
+                                            }
+                                        }
+                                    });
+
+                                if ui.button("Новый").clicked() {
+                                    new_host_profile_requested = true;
+                                }
+                                if ui.button("Сохранить").clicked() {
+                                    save_host_profile_requested = true;
+                                }
+                                if self.server_profiles.len() > 1 && ui.button("Удалить").clicked() {
+                                    delete_host_profile_requested = true;
+                                }
+                            });
+
+                            ui.add_space(8.0);
+                            ui.separator();
+
+                            // Tabs: Network, Sandbox, World
+                            ui.horizontal(|ui| {
+                                if ui.selectable_label(self.host_active_tab == HostConfigTab::Network, "1. Сеть (Network)").clicked() {
+                                    self.host_active_tab = HostConfigTab::Network;
+                                }
+                                if ui.selectable_label(self.host_active_tab == HostConfigTab::Sandbox, "2. Песочница (Sandbox)").clicked() {
+                                    self.host_active_tab = HostConfigTab::Sandbox;
+                                }
+                                if ui.selectable_label(self.host_active_tab == HostConfigTab::World, "3. Мир (World)").clicked() {
+                                    self.host_active_tab = HostConfigTab::World;
+                                }
+                            });
+                            ui.separator();
+                            ui.add_space(6.0);
+
+                            match self.host_active_tab {
+                                HostConfigTab::Network => {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Имя сервера:");
+                                        ui.add_sized([300.0, 22.0], egui::TextEdit::singleline(&mut self.active_host_profile.server_name));
+                                    });
                                     ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("Порт сервера:");
+                                        let mut port_str = self.active_host_profile.port.to_string();
+                                        if ui.add_sized([90.0, 22.0], egui::TextEdit::singleline(&mut port_str)).changed() {
+                                            if let Ok(p) = port_str.parse() {
+                                                self.active_host_profile.port = p;
+                                            }
+                                        }
+                                        ui.weak("(по умолчанию: 25565)");
+                                    });
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("Максимум игроков:");
+                                        let mut max_p = self.active_host_profile.max_players as u32;
+                                        if ui.add(egui::Slider::new(&mut max_p, 2..=32)).changed() {
+                                            self.active_host_profile.max_players = max_p as u16;
+                                        }
+                                    });
+                                    ui.add_space(6.0);
+                                    let mut has_pw = self.active_host_profile.password.is_some();
+                                    if ui.checkbox(&mut has_pw, "Защитить паролем").changed() {
+                                        if has_pw {
+                                            self.active_host_profile.password = Some("1234".to_string());
+                                        } else {
+                                            self.active_host_profile.password = None;
+                                        }
+                                    }
+                                    if let Some(pw) = &mut self.active_host_profile.password {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Пароль:");
+                                            ui.add_sized([180.0, 22.0], egui::TextEdit::singleline(pw));
+                                        });
+                                    }
+                                    ui.add_space(6.0);
+                                    ui.checkbox(&mut self.active_host_profile.public_lan_announce, "Анонсировать в локальной сети (LAN Broadcast)");
+                                }
+                                HostConfigTab::Sandbox => {
+                                    ui.checkbox(&mut self.active_host_profile.sandbox.pvp_enabled, "Включить PvP (урон между игроками)");
+                                    ui.add_space(4.0);
+                                    ui.checkbox(&mut self.active_host_profile.sandbox.structural_integrity, "Сопромат построек (физическое обрушение)");
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("Множитель популяции:");
+                                        ui.add(egui::Slider::new(&mut self.active_host_profile.sandbox.population_multiplier, 0.1..=5.0).text("x"));
+                                    });
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("Гравитация:");
+                                        ui.add(egui::Slider::new(&mut self.active_host_profile.sandbox.gravity_multiplier, 0.1..=3.0).text("x"));
+                                    });
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("Режим спавна:");
+                                        let modes = ["Safe", "Migration", "Hardcore", "NoRespawnCleaned"];
+                                        for m in modes {
+                                            if ui.selectable_label(self.active_host_profile.sandbox.spawn_mode == m, m).clicked() {
+                                                self.active_host_profile.sandbox.spawn_mode = m.to_string();
+                                            }
+                                        }
+                                    });
+                                }
+                                HostConfigTab::World => {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Папка сохранения:");
+                                        ui.add_sized([260.0, 22.0], egui::TextEdit::singleline(&mut self.active_host_profile.save_folder_name));
+                                    });
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("Сид мира:");
+                                        let mut seed_str = self.active_host_profile.world_seed.to_string();
+                                        if ui.add_sized([160.0, 22.0], egui::TextEdit::singleline(&mut seed_str)).changed() {
+                                            if let Ok(s) = seed_str.parse() {
+                                                self.active_host_profile.world_seed = s;
+                                            }
+                                        }
+                                    });
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("Режим игры:");
+                                        let is_surv = self.active_host_profile.experience_id == "survival";
+                                        if ui.selectable_label(is_surv, "Выживание").clicked() {
+                                            self.active_host_profile.experience_id = "survival".to_string();
+                                        }
+                                        let is_creat = self.active_host_profile.experience_id == "creative";
+                                        if ui.selectable_label(is_creat, "Креатив").clicked() {
+                                            self.active_host_profile.experience_id = "creative".to_string();
+                                        }
+                                    });
                                 }
                             }
+
+                            if let Some((msg, is_err)) = &self.host_status_msg {
+                                ui.add_space(6.0);
+                                let col = if *is_err { egui::Color32::RED } else { egui::Color32::GREEN };
+                                ui.colored_label(col, msg);
+                            }
+
+                            ui.add_space(14.0);
+                            ui.separator();
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                if ui.add_sized([220.0, 36.0], egui::Button::new(
+                                    egui::RichText::new("Запустить сервер").strong().color(egui::Color32::WHITE)
+                                )).clicked() {
+                                    start_host_session_requested = true;
+                                }
+                                if ui.add_sized([140.0, 36.0], egui::Button::new("Назад")).clicked() {
+                                    back_to_title_requested = true;
+                                }
+                            });
+                        });
+                }
+                MenuScreen::JoinServer => {
+                    egui::Window::new("JoinServerScreen")
+                        .collapsible(false)
+                        .resizable(false)
+                        .title_bar(false)
+                        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                        .frame(
+                            egui::Frame::NONE
+                                .fill(egui::Color32::from_black_alpha(195))
+                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(45)))
+                                .corner_radius(10.0)
+                                .inner_margin(egui::Margin::symmetric(28, 22)),
+                        )
+                        .fixed_size(egui::vec2(460.0, 420.0))
+                        .show(ctx, |ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    egui::RichText::new("СЕТЕВАЯ ИГРА (JOIN SERVER)")
+                                        .size(19.0)
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                );
+                                ui.label(
+                                    egui::RichText::new("Поиск локальных LAN серверов или прямое подключение")
+                                        .size(11.0)
+                                        .color(egui::Color32::from_white_alpha(140)),
+                                );
+                                ui.add_space(10.0);
+                            });
 
                             ui.horizontal(|ui| {
                                 ui.label("Ваш никнейм:");
@@ -2834,116 +3159,88 @@ impl EngineApp {
                                     settings_changed = true;
                                 }
                             });
-                            ui.add_space(8.0);
+                            ui.add_space(6.0);
                             ui.separator();
-                            ui.add_space(8.0);
 
-                            if self.server_host.is_some() {
-                                let host = self.server_host.as_ref().unwrap();
-                                let count = host.client_count();
-                                ui.label(egui::RichText::new("Сервер запущен (Вы хост)").strong().color(egui::Color32::GREEN));
-                                ui.label(format!("Порт: {}", host.port));
-                                ui.label(format!("Игроков онлайн: {}", count + 1));
-                                let remote_list: Vec<(String, Vec3)> = self.host_remote_players.values().map(|p| (p.name.clone(), p.current_pos)).collect();
-                                if !remote_list.is_empty() {
-                                    ui.add_space(4.0);
-                                    for (p_name, p_pos) in remote_list {
-                                        ui.horizontal(|ui| {
-                                            ui.label(format!("• {p_name}"));
-                                            if ui.small_button("ТП").clicked() {
-                                                tp_to_player_requested = Some((p_name, p_pos));
+                            ui.horizontal(|ui| {
+                                if ui.selectable_label(self.join_tab == JoinTab::Lan, "LAN-серверы").clicked() {
+                                    self.join_tab = JoinTab::Lan;
+                                }
+                                if ui.selectable_label(self.join_tab == JoinTab::Direct, "Прямое подключение").clicked() {
+                                    self.join_tab = JoinTab::Direct;
+                                }
+                            });
+                            ui.separator();
+                            ui.add_space(6.0);
+
+                            match self.join_tab {
+                                JoinTab::Lan => {
+                                    if self.discovery_scanner.servers.is_empty() {
+                                        ui.vertical_centered(|ui| {
+                                            ui.add_space(20.0);
+                                            ui.label(egui::RichText::new("Поиск серверов в локальной сети...").color(egui::Color32::GRAY));
+                                            ui.weak("(Убедитесь, что хост включил 'Анонсировать в LAN')");
+                                        });
+                                    } else {
+                                        egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                                            for server in self.discovery_scanner.servers.clone() {
+                                                ui.group(|ui| {
+                                                    ui.horizontal(|ui| {
+                                                        ui.vertical(|ui| {
+                                                            ui.label(egui::RichText::new(&server.name).strong().color(egui::Color32::WHITE));
+                                                            ui.weak(format!("IP: {} | Игроков: {}", server.addr, server.player_count));
+                                                        });
+                                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                            if ui.button("Войти").clicked() {
+                                                                let pw = if self.join_password_input.is_empty() { None } else { Some(self.join_password_input.clone()) };
+                                                                connect_to_server_requested = Some((server.addr, pw));
+                                                            }
+                                                        });
+                                                    });
+                                                });
                                             }
                                         });
                                     }
                                 }
-                                ui.add_space(10.0);
-
-                                ui.horizontal(|ui| {
-                                    if ui.add_sized([140.0, 32.0], egui::Button::new("В игру")).clicked() {
-                                        resume_requested = true;
-                                    }
-                                    if ui.add_sized([140.0, 32.0], egui::Button::new("Остановить")).clicked() {
-                                        stop_server_requested = true;
-                                    }
-                                });
-                            } else if self.game_client.is_some() {
-                                let client = self.game_client.as_ref().unwrap();
-                                ui.label(egui::RichText::new("Подключено к серверу").strong().color(egui::Color32::GREEN));
-                                ui.label(format!("Адрес: {}", client.server_addr));
-                                ui.label(format!("Игроков онлайн: {}", client.remote_players.len() + 1));
-                                let remote_list: Vec<(String, Vec3)> = client.remote_players.values().map(|p| (p.name.clone(), p.current_pos)).collect();
-                                if !remote_list.is_empty() {
-                                    ui.add_space(4.0);
-                                    for (p_name, p_pos) in remote_list {
-                                        ui.horizontal(|ui| {
-                                            ui.label(format!("• {p_name}"));
-                                            if ui.small_button("ТП").clicked() {
-                                                tp_to_player_requested = Some((p_name, p_pos));
-                                            }
-                                        });
-                                    }
-                                }
-                                ui.add_space(10.0);
-
-                                ui.horizontal(|ui| {
-                                    if ui.add_sized([140.0, 32.0], egui::Button::new("В игру")).clicked() {
-                                        resume_requested = true;
-                                    }
-                                    if ui.add_sized([140.0, 32.0], egui::Button::new("Отключиться")).clicked() {
-                                        disconnect_client_requested = true;
-                                    }
-                                });
-                            } else {
-                                ui.label(egui::RichText::new("1. Создать сервер (Хост)").strong());
-                                ui.add_space(2.0);
-                                ui.horizontal(|ui| {
-                                    ui.label("Порт:");
-                                    ui.add_sized([80.0, 22.0], egui::TextEdit::singleline(&mut self.server_port_input));
-                                    if ui.add_sized([160.0, 26.0], egui::Button::new("Запустить сервер")).clicked() {
-                                        start_server_requested = true;
-                                    }
-                                });
-
-                                ui.add_space(10.0);
-                                ui.separator();
-                                ui.add_space(8.0);
-
-                                ui.label(egui::RichText::new("2. Подключиться к другу").strong());
-                                ui.add_space(2.0);
-                                ui.horizontal(|ui| {
-                                    ui.label("Адрес:");
-                                    ui.add_sized(
-                                        [170.0, 22.0],
-                                        egui::TextEdit::singleline(&mut self.connect_ip_input)
-                                            .hint_text("IP или IP:порт"),
-                                    );
-                                    if ui.add_sized([110.0, 26.0], egui::Button::new("Подключиться")).clicked() {
-                                        connect_requested = true;
-                                    }
-                                });
-
-                                if !self.discovery_scanner.servers.is_empty() {
-                                    ui.add_space(8.0);
-                                    ui.label(egui::RichText::new("Найденные локальные серверы:").size(11.0));
-                                    for server in self.discovery_scanner.servers.clone() {
-                                        ui.horizontal(|ui| {
-                                            ui.label(egui::RichText::new(&server.name).size(12.0));
-                                            ui.weak(format!("({})", server.addr));
-                                            if ui.button("Войти").clicked() {
-                                                self.connect_ip_input = server.addr.to_string();
-                                                connect_requested = true;
-                                            }
-                                        });
-                                    }
+                                JoinTab::Direct => {
+                                    ui.horizontal(|ui| {
+                                        ui.label("IP / Хост:");
+                                        ui.add_sized([220.0, 22.0], egui::TextEdit::singleline(&mut self.connect_ip_input).hint_text("127.0.0.1"));
+                                    });
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("Порт:");
+                                        ui.add_sized([90.0, 22.0], egui::TextEdit::singleline(&mut self.server_port_input).hint_text("25565"));
+                                    });
                                 }
                             }
 
-                            ui.add_space(16.0);
-                            ui.separator();
                             ui.add_space(8.0);
-                            ui.vertical_centered(|ui| {
-                                if ui.add_sized([180.0, 30.0], egui::Button::new("Назад")).clicked() {
-                                    back_to_pause_requested = true;
+                            ui.horizontal(|ui| {
+                                ui.label("Пароль сервера:");
+                                ui.add_sized([160.0, 22.0], egui::TextEdit::singleline(&mut self.join_password_input).password(true).hint_text("если требуется"));
+                            });
+
+                            if let Some((msg, color, ts)) = &self.net_status {
+                                if ts.elapsed().as_secs() < 8 {
+                                    ui.add_space(6.0);
+                                    ui.colored_label(*color, msg);
+                                }
+                            }
+
+                            ui.add_space(12.0);
+                            ui.separator();
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                if self.join_tab == JoinTab::Direct {
+                                    if ui.add_sized([180.0, 36.0], egui::Button::new(
+                                        egui::RichText::new("Подключиться").strong().color(egui::Color32::WHITE)
+                                    )).clicked() {
+                                        connect_requested = true;
+                                    }
+                                }
+                                if ui.add_sized([120.0, 36.0], egui::Button::new("Назад")).clicked() {
+                                    back_to_title_requested = true;
                                 }
                             });
                         });
@@ -3305,9 +3602,10 @@ impl EngineApp {
                 .trim()
                 .parse::<u16>()
                 .unwrap_or(DEFAULT_PORT);
-            let seed = 12345;
             let initial_edits = self.world.get_all_raw_edits();
-            match ServerHost::start(port, seed, self.time_of_day, initial_edits) {
+            let mut prof = self.active_host_profile.clone();
+            prof.port = port;
+            match ServerHost::start(prof, self.time_of_day, initial_edits) {
                 Ok(host) => {
                     let my_name = self.settings.player_name.clone();
                     self.discovery_beacon = Some(DiscoveryBeacon::new(my_name, port));
@@ -3353,7 +3651,8 @@ impl EngineApp {
                 Ok(addr) => {
                     self.settings.last_connected_ip = ip_str.to_string();
                     self.apply_settings();
-                    match GameClient::connect(addr, &self.settings.player_name) {
+                    let pw = if self.join_password_input.trim().is_empty() { None } else { Some(self.join_password_input.trim().to_string()) };
+                    match GameClient::connect(addr, &self.settings.player_name, pw) {
                         Ok(client) => {
                             self.game_client = Some(client);
                             self.screen = MenuScreen::Playing;
@@ -3400,6 +3699,10 @@ impl EngineApp {
         } else if play_selected_world_requested {
             if let Some(id) = &self.selected_world_id {
                 if let Some(meta) = self.cached_world_list.iter().find(|w| &w.id == id).cloned() {
+                    self.session_type = SessionType::Solo;
+                    self.server_host = None;
+                    self.discovery_beacon = None;
+                    self.game_client = None;
                     self.load_world(meta);
                 }
             }
@@ -3442,6 +3745,10 @@ impl EngineApp {
                 Ok(meta) => {
                     self.cached_world_list = WorldManager::list_worlds();
                     self.selected_world_id = Some(meta.id.clone());
+                    self.session_type = SessionType::Solo;
+                    self.server_host = None;
+                    self.discovery_beacon = None;
+                    self.game_client = None;
                     self.load_world(meta);
                 }
                 Err(e) => {
@@ -3455,6 +3762,161 @@ impl EngineApp {
             self.player_pitch = self.camera.pitch;
             self.set_cursor_lock(false);
             self.screen = MenuScreen::Title;
+        } else if open_host_server_requested {
+            self.return_screen = MenuScreen::Title;
+            self.screen = MenuScreen::HostServer;
+        } else if open_join_server_requested {
+            self.return_screen = MenuScreen::Title;
+            self.screen = MenuScreen::JoinServer;
+        } else if new_host_profile_requested {
+            let new_name = format!("Profile_{}", self.server_profiles.len() + 1);
+            let mut new_prof = ServerHostProfile::default();
+            new_prof.server_name = format!("Server {}", self.server_profiles.len() + 1);
+            new_prof.save_folder_name = format!("world_host_{}", self.server_profiles.len() + 1);
+            let _ = WorldManager::save_server_profile(&new_name, &new_prof);
+            self.server_profiles = WorldManager::list_server_profiles();
+            self.host_profile_name_input = new_name;
+            self.active_host_profile = new_prof;
+            self.host_status_msg = Some(("Создан новый профиль сервера".to_string(), false));
+        } else if save_host_profile_requested {
+            match WorldManager::save_server_profile(&self.host_profile_name_input, &self.active_host_profile) {
+                Ok(()) => {
+                    self.server_profiles = WorldManager::list_server_profiles();
+                    self.host_status_msg = Some(("Настройки профиля сохранены".to_string(), false));
+                }
+                Err(e) => {
+                    self.host_status_msg = Some((format!("Ошибка сохранения: {e}"), true));
+                }
+            }
+        } else if delete_host_profile_requested {
+            let _ = WorldManager::delete_server_profile(&self.host_profile_name_input);
+            self.server_profiles = WorldManager::list_server_profiles();
+            if let Some((name, prof)) = self.server_profiles.first() {
+                self.host_profile_name_input = name.clone();
+                self.active_host_profile = prof.clone();
+            }
+            self.host_status_msg = Some(("Профиль удалён".to_string(), false));
+        } else if start_host_session_requested {
+            // Save current profile to disk
+            let _ = WorldManager::save_server_profile(&self.host_profile_name_input, &self.active_host_profile);
+            self.server_profiles = WorldManager::list_server_profiles();
+
+            // Ensure world exists for this save_folder_name or create new
+            let folder_name = &self.active_host_profile.save_folder_name;
+            let mut world_meta = WorldManager::list_worlds().into_iter().find(|w| w.id == *folder_name);
+            if world_meta.is_none() {
+                let seed_u32 = self.active_host_profile.world_seed as u32;
+                let mode_str = if self.active_host_profile.experience_id == "creative" { "Creative" } else { "Survival" };
+                let created = WorldManager::create_world(
+                    &self.active_host_profile.server_name,
+                    seed_u32,
+                    mode_str,
+                    "Lithosphere",
+                    [0.5, 42.0, 0.5],
+                );
+                if let Ok(meta) = created {
+                    world_meta = Some(meta);
+                }
+            }
+
+            if let Some(meta) = world_meta {
+                self.load_world(meta);
+            }
+
+            let initial_edits = self.world.get_all_raw_edits();
+            match ServerHost::start(self.active_host_profile.clone(), self.time_of_day, initial_edits) {
+                Ok(host) => {
+                    let port = host.port();
+                    let s_name = host.profile.server_name.clone();
+                    let announce = host.profile.public_lan_announce;
+                    self.server_host = Some(host);
+                    if announce {
+                        self.discovery_beacon = Some(DiscoveryBeacon::new(s_name, port));
+                    } else {
+                        self.discovery_beacon = None;
+                    }
+                    self.game_client = None;
+                    self.session_type = SessionType::Host;
+                    self.screen = MenuScreen::Playing;
+                    self.set_cursor_lock(true);
+                    self.push_chat(
+                        format!("[Хост] Сервер '{}' запущен на порту {port}!", self.active_host_profile.server_name),
+                        egui::Color32::from_rgb(100, 255, 120),
+                    );
+                }
+                Err(e) => {
+                    self.host_status_msg = Some((format!("Ошибка запуска сервера: {e}"), true));
+                }
+            }
+        } else if let Some((addr, pw)) = connect_to_server_requested {
+            let p_name = self.settings.player_name.clone();
+            match GameClient::connect(addr, &p_name, pw) {
+                Ok(client) => {
+                    self.game_client = Some(client);
+                    self.server_host = None;
+                    self.discovery_beacon = None;
+                    self.session_type = SessionType::Client;
+                    self.screen = MenuScreen::Playing;
+                    self.set_cursor_lock(true);
+                    self.push_chat(
+                        format!("[Сеть] Подключение к серверу {addr}..."),
+                        egui::Color32::from_rgb(100, 220, 255),
+                    );
+                }
+                Err(e) => {
+                    self.net_status = Some((format!("Ошибка подключения: {e}"), egui::Color32::RED, Instant::now()));
+                }
+            }
+        } else if connect_requested {
+            let port = self.server_port_input.trim().parse::<u16>().unwrap_or(25565);
+            let host_ip = if self.connect_ip_input.trim().is_empty() {
+                "127.0.0.1"
+            } else {
+                self.connect_ip_input.trim()
+            };
+            let addr_str = if host_ip.contains(':') {
+                host_ip.to_string()
+            } else {
+                format!("{host_ip}:{port}")
+            };
+            if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+                let pw = if self.join_password_input.trim().is_empty() { None } else { Some(self.join_password_input.trim().to_string()) };
+                let p_name = self.settings.player_name.clone();
+                match GameClient::connect(addr, &p_name, pw) {
+                    Ok(client) => {
+                        self.game_client = Some(client);
+                        self.server_host = None;
+                        self.discovery_beacon = None;
+                        self.session_type = SessionType::Client;
+                        self.screen = MenuScreen::Playing;
+                        self.set_cursor_lock(true);
+                        self.push_chat(
+                            format!("[Сеть] Подключение к серверу {addr}..."),
+                            egui::Color32::from_rgb(100, 220, 255),
+                        );
+                    }
+                    Err(e) => {
+                        self.net_status = Some((format!("Ошибка подключения: {e}"), egui::Color32::RED, Instant::now()));
+                    }
+                }
+            } else {
+                self.net_status = Some(("Неверный IP-адрес сервера".to_string(), egui::Color32::RED, Instant::now()));
+            }
+        } else if let Some(id) = kick_client_requested {
+            if let Some(host) = &mut self.server_host {
+                host.kick_client(id, "Кикнут хостом сервера");
+                self.push_chat(format!("[Хост] Игрок #{id} кикнут с сервера"), egui::Color32::YELLOW);
+            }
+        } else if let Some(id) = teleport_client_to_host_requested {
+            if let Some(host) = &mut self.server_host {
+                host.teleport_client(id, self.player_pos);
+                self.push_chat(format!("[Хост] Игрок #{id} телепортирован к хосту"), egui::Color32::GREEN);
+            }
+        } else if apply_live_rules_requested {
+            if let Some(host) = &mut self.server_host {
+                host.update_sandbox_rules(self.active_host_profile.sandbox.clone());
+                self.push_chat("[Хост] Обновленные правила песочницы применены для всех игроков!", egui::Color32::from_rgb(100, 255, 120));
+            }
         } else if resume_requested {
             self.resume_game();
         } else if open_settings_requested {
@@ -3465,12 +3927,8 @@ impl EngineApp {
             };
             self.screen = MenuScreen::Settings;
         } else if open_multiplayer_requested {
-            self.return_screen = if self.screen == MenuScreen::Title {
-                MenuScreen::Title
-            } else {
-                MenuScreen::Pause
-            };
-            self.screen = MenuScreen::Multiplayer;
+            self.return_screen = MenuScreen::Title;
+            self.screen = MenuScreen::JoinServer;
         } else if back_to_pause_requested {
             self.rebinding = None;
             self.screen = self.return_screen;
@@ -3809,7 +4267,7 @@ impl ApplicationHandler for EngineApp {
                         MenuScreen::SelectWorld => self.screen = MenuScreen::Title,
                         MenuScreen::CreateWorld => self.screen = MenuScreen::SelectWorld,
                         MenuScreen::Playing => self.open_pause(),
-                        MenuScreen::Settings | MenuScreen::Multiplayer => {
+                        MenuScreen::Settings | MenuScreen::HostServer | MenuScreen::JoinServer => {
                             self.screen = self.return_screen;
                         }
                         MenuScreen::Pause => self.resume_game(),
@@ -3934,7 +4392,7 @@ impl ApplicationHandler for EngineApp {
                                     MenuScreen::SelectWorld => self.screen = MenuScreen::Title,
                                     MenuScreen::CreateWorld => self.screen = MenuScreen::SelectWorld,
                                     MenuScreen::Playing => self.open_pause(),
-                                    MenuScreen::Settings | MenuScreen::Multiplayer => {
+                                    MenuScreen::Settings | MenuScreen::HostServer | MenuScreen::JoinServer => {
                                         self.screen = self.return_screen;
                                     }
                                     MenuScreen::Pause => self.resume_game(),
@@ -4131,6 +4589,8 @@ impl ApplicationHandler for EngineApp {
                 if self.screen != MenuScreen::Title
                     && self.screen != MenuScreen::SelectWorld
                     && self.screen != MenuScreen::CreateWorld
+                    && self.screen != MenuScreen::HostServer
+                    && self.screen != MenuScreen::JoinServer
                 {
                     let held_colors = if let Some(item) = self.inventory.selected_item() {
                         if item.block_id != BlockId::AIR {

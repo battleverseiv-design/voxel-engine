@@ -1,6 +1,9 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 
+use engine_core::{SandboxOverrides, ServerHostProfile};
+use glam::Vec3;
+
 use crate::protocol::{Packet, PROTOCOL_VERSION};
 
 pub struct ConnectedClient {
@@ -55,8 +58,7 @@ pub enum HostEvent {
 
 pub struct ServerHost {
     listener: TcpListener,
-    pub port: u16,
-    pub seed: u32,
+    pub profile: ServerHostProfile,
     pub time_of_day: f32,
     pub edits: Vec<([i32; 3], u16)>,
     clients: Vec<ConnectedClient>,
@@ -65,27 +67,38 @@ pub struct ServerHost {
 
 impl ServerHost {
     pub fn start(
-        port: u16,
-        seed: u32,
+        profile: ServerHostProfile,
         time_of_day: f32,
         initial_edits: Vec<([i32; 3], u16)>,
     ) -> std::io::Result<Self> {
+        let port = profile.port;
         let listener = TcpListener::bind(format!("0.0.0.0:{port}"))?;
         listener.set_nonblocking(true)?;
 
         Ok(Self {
             listener,
-            port,
-            seed,
+            profile,
             time_of_day,
             edits: initial_edits,
             clients: Vec::new(),
-            next_client_id: 1, // 0 is host player
+            next_client_id: 1, // 0 is reserved for local host player
         })
     }
 
     pub fn client_count(&self) -> usize {
         self.clients.len()
+    }
+
+    pub fn clients(&self) -> &[ConnectedClient] {
+        &self.clients
+    }
+
+    pub fn get_client(&self, id: u32) -> Option<&ConnectedClient> {
+        self.clients.iter().find(|c| c.id == id)
+    }
+
+    pub fn port(&self) -> u16 {
+        self.profile.port
     }
 
     pub fn broadcast(&mut self, packet: &Packet) {
@@ -102,6 +115,43 @@ impl ServerHost {
                 let _ = client.stream.write_all(&bytes);
             }
         }
+    }
+
+    /// Admin function: kicks a connected client with an explanation reason.
+    pub fn kick_client(&mut self, id: u32, reason: &str) -> Option<HostEvent> {
+        if let Some(pos) = self.clients.iter().position(|c| c.id == id) {
+            let mut client = self.clients.remove(pos);
+            let kick_pkt = Packet::Kick {
+                reason: reason.to_string(),
+            };
+            let _ = client.stream.write_all(&kick_pkt.encode());
+            let _ = client.stream.flush();
+
+            let left_event = HostEvent::ClientLeft {
+                id: client.id,
+                name: client.name.clone(),
+            };
+            self.broadcast(&Packet::PlayerLeft { id });
+            Some(left_event)
+        } else {
+            None
+        }
+    }
+
+    /// Admin function: teleports a connected client directly to the specified coordinates.
+    pub fn teleport_client(&mut self, id: u32, pos: Vec3) {
+        if let Some(client) = self.clients.iter_mut().find(|c| c.id == id) {
+            let tp_pkt = Packet::Teleport {
+                pos: pos.to_array(),
+            };
+            let _ = client.stream.write_all(&tp_pkt.encode());
+        }
+    }
+
+    /// Admin function: updates the sandbox physics and rules on the fly, immediately broadcasting to all clients.
+    pub fn update_sandbox_rules(&mut self, sandbox: SandboxOverrides) {
+        self.profile.sandbox = sandbox.clone();
+        self.broadcast(&Packet::RulesUpdate { sandbox });
     }
 
     pub fn poll_events(&mut self) -> Vec<HostEvent> {
@@ -126,8 +176,9 @@ impl ServerHost {
         // 2. Read incoming data from existing clients
         let mut disconnected_ids = Vec::new();
         let mut temp_buf = [0u8; 4096];
+        let total_clients = self.clients.len();
 
-        for i in 0..self.clients.len() {
+        for i in 0..total_clients {
             let client = &mut self.clients[i];
             loop {
                 match client.stream.read(&mut temp_buf) {
@@ -154,24 +205,64 @@ impl ServerHost {
                 client.read_buf.drain(0..consumed);
 
                 match packet {
-                    Packet::Join { protocol, name } => {
-                        if protocol == PROTOCOL_VERSION {
-                            client.name = name.clone();
-                            // Send Welcome to this client
-                            let welcome = Packet::Welcome {
-                                assigned_id: client.id,
-                                seed: self.seed,
-                                time_of_day: self.time_of_day,
-                                edits: self.edits.clone(),
+                    Packet::Join { protocol, name, password } => {
+                        if protocol != PROTOCOL_VERSION {
+                            let disc = Packet::DisconnectReason {
+                                reason: format!("Несовпадение версии протокола (Сервер: {PROTOCOL_VERSION}, Клиент: {protocol})"),
                             };
-                            let _ = client.stream.write_all(&welcome.encode());
-
-                            events.push(HostEvent::ClientJoined {
-                                id: client.id,
-                                name: client.name.clone(),
-                                addr: client.addr,
-                            });
+                            let _ = client.stream.write_all(&disc.encode());
+                            disconnected_ids.push(client.id);
+                            continue;
                         }
+
+                        // Check max players limit
+                        if total_clients > self.profile.max_players as usize {
+                            let disc = Packet::DisconnectReason {
+                                reason: "Сервер переполнен (Server is full)".to_string(),
+                            };
+                            let _ = client.stream.write_all(&disc.encode());
+                            disconnected_ids.push(client.id);
+                            continue;
+                        }
+
+                        // Check server password
+                        if let Some(req_pw) = &self.profile.password {
+                            let pw_matches = password.as_deref() == Some(req_pw.as_str());
+                            if !pw_matches {
+                                let disc = Packet::DisconnectReason {
+                                    reason: "Неверный пароль сервера (Incorrect password)".to_string(),
+                                };
+                                let _ = client.stream.write_all(&disc.encode());
+                                disconnected_ids.push(client.id);
+                                continue;
+                            }
+                        }
+
+                        client.name = name.clone();
+
+                        // 1. Send HostHandshake with server profile rules & sandbox
+                        let handshake = Packet::HostHandshake {
+                            server_name: self.profile.server_name.clone(),
+                            experience_id: self.profile.experience_id.clone(),
+                            sandbox: self.profile.sandbox.clone(),
+                            experience_manifest: "voxel_core_v1".to_string(),
+                        };
+                        let _ = client.stream.write_all(&handshake.encode());
+
+                        // 2. Send Welcome with assigned id and world state
+                        let welcome = Packet::Welcome {
+                            assigned_id: client.id,
+                            seed: self.profile.world_seed as u32,
+                            time_of_day: self.time_of_day,
+                            edits: self.edits.clone(),
+                        };
+                        let _ = client.stream.write_all(&welcome.encode());
+
+                        events.push(HostEvent::ClientJoined {
+                            id: client.id,
+                            name: client.name.clone(),
+                            addr: client.addr,
+                        });
                     }
                     Packet::PlayerState {
                         id: _,
@@ -218,12 +309,15 @@ impl ServerHost {
                         damage,
                         knockback,
                     } => {
-                        events.push(HostEvent::HitPlayer {
-                            attacker_id,
-                            target_id,
-                            damage,
-                            knockback,
-                        });
+                        // If PvP is disabled in host sandbox, ignore damage packets between players
+                        if self.profile.sandbox.pvp_enabled {
+                            events.push(HostEvent::HitPlayer {
+                                attacker_id,
+                                target_id,
+                                damage,
+                                knockback,
+                            });
+                        }
                     }
                     Packet::PlayerHealth { player_id, health } => {
                         events.push(HostEvent::PlayerHealth { player_id, health });
@@ -298,7 +392,26 @@ impl ServerHost {
                         text: text.clone(),
                     });
                 }
-                _ => {}
+                HostEvent::HitPlayer {
+                    attacker_id,
+                    target_id,
+                    damage,
+                    knockback,
+                } => {
+                    self.broadcast(&Packet::HitPlayer {
+                        attacker_id: *attacker_id,
+                        target_id: *target_id,
+                        damage: *damage,
+                        knockback: *knockback,
+                    });
+                }
+                HostEvent::PlayerHealth { player_id, health } => {
+                    self.broadcast(&Packet::PlayerHealth {
+                        player_id: *player_id,
+                        health: *health,
+                    });
+                }
+                HostEvent::ClientLeft { .. } => {}
             }
         }
 

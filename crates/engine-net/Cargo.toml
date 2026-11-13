@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 engine-core = { path = "../engine-core" }
 glam.workspace = true
+serde.workspace = true

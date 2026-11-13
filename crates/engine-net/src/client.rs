@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 
+use engine_core::SandboxOverrides;
 use glam::Vec3;
 
 use crate::protocol::{Packet, RemotePlayer, PROTOCOL_VERSION};
@@ -13,6 +14,11 @@ pub enum ClientEvent {
         seed: u32,
         time_of_day: f32,
         edits: Vec<([i32; 3], u16)>,
+    },
+    HostHandshakeReceived {
+        server_name: String,
+        experience_id: String,
+        sandbox: SandboxOverrides,
     },
     BlockChange {
         pos: [i32; 3],
@@ -40,7 +46,10 @@ pub enum ClientEvent {
         player_id: u32,
         health: f32,
     },
+    Teleported([f32; 3]),
+    RulesUpdated(SandboxOverrides),
     Disconnected,
+    DisconnectedWithReason(String),
 }
 
 pub struct GameClient {
@@ -49,11 +58,16 @@ pub struct GameClient {
     pub my_id: u32,
     pub is_connected: bool,
     pub remote_players: HashMap<u32, RemotePlayer>,
+    pub sandbox: SandboxOverrides,
     read_buf: Vec<u8>,
 }
 
 impl GameClient {
-    pub fn connect(server_addr: SocketAddr, player_name: &str) -> std::io::Result<Self> {
+    pub fn connect(
+        server_addr: SocketAddr,
+        player_name: &str,
+        password: Option<String>,
+    ) -> std::io::Result<Self> {
         let stream = TcpStream::connect_timeout(&server_addr, std::time::Duration::from_secs(12))?;
         stream.set_nonblocking(true)?;
         let _ = stream.set_nodelay(true);
@@ -64,13 +78,15 @@ impl GameClient {
             my_id: 0,
             is_connected: false,
             remote_players: HashMap::new(),
+            sandbox: SandboxOverrides::default(),
             read_buf: Vec::with_capacity(8192),
         };
 
-        // Send Join handshake packet
+        // Send Join handshake packet with optional password
         let join = Packet::Join {
             protocol: PROTOCOL_VERSION,
             name: player_name.to_string(),
+            password,
         };
         client.send_packet(&join)?;
 
@@ -128,6 +144,30 @@ impl GameClient {
         let _ = self.send_packet(&packet);
     }
 
+    pub fn send_hit_player(&mut self, target_id: u32, damage: f32, knockback: Vec3) {
+        if !self.is_connected {
+            return;
+        }
+        let packet = Packet::HitPlayer {
+            attacker_id: self.my_id,
+            target_id,
+            damage,
+            knockback: knockback.to_array(),
+        };
+        let _ = self.send_packet(&packet);
+    }
+
+    pub fn send_health_update(&mut self, health: f32) {
+        if !self.is_connected {
+            return;
+        }
+        let packet = Packet::PlayerHealth {
+            player_id: self.my_id,
+            health,
+        };
+        let _ = self.send_packet(&packet);
+    }
+
     pub fn update_remote_players(&mut self, dt: f32) {
         for player in self.remote_players.values_mut() {
             player.interpolate(dt);
@@ -163,6 +203,19 @@ impl GameClient {
             self.read_buf.drain(0..consumed);
 
             match packet {
+                Packet::HostHandshake {
+                    server_name,
+                    experience_id,
+                    sandbox,
+                    experience_manifest: _,
+                } => {
+                    self.sandbox = sandbox.clone();
+                    events.push(ClientEvent::HostHandshakeReceived {
+                        server_name,
+                        experience_id,
+                        sandbox,
+                    });
+                }
                 Packet::Welcome {
                     assigned_id,
                     seed,
@@ -177,6 +230,17 @@ impl GameClient {
                         time_of_day,
                         edits,
                     });
+                }
+                Packet::DisconnectReason { reason } | Packet::Kick { reason } => {
+                    self.is_connected = false;
+                    events.push(ClientEvent::DisconnectedWithReason(reason));
+                }
+                Packet::Teleport { pos } => {
+                    events.push(ClientEvent::Teleported(pos));
+                }
+                Packet::RulesUpdate { sandbox } => {
+                    self.sandbox = sandbox.clone();
+                    events.push(ClientEvent::RulesUpdated(sandbox));
                 }
                 Packet::PlayerState {
                     id,

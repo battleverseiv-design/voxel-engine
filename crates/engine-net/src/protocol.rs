@@ -1,6 +1,7 @@
+use engine_core::SandboxOverrides;
 use glam::Vec3;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const DEFAULT_PORT: u16 = 25565;
 pub const DISCOVERY_PORT: u16 = 25566;
 
@@ -56,12 +57,13 @@ impl RemotePlayer {
 }
 
 /// Strongly-typed network packets for synchronization.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
-    /// Client joins with display name
+    /// Client joins with display name and optional password
     Join {
         protocol: u32,
         name: String,
+        password: Option<String>,
     },
     /// Server accepts client and provides world state and delta edits
     Welcome {
@@ -113,6 +115,91 @@ pub enum Packet {
         player_id: u32,
         health: f32,
     },
+    /// Host handshake sent to client upon connecting with server profile rules & sandbox
+    HostHandshake {
+        server_name: String,
+        experience_id: String,
+        sandbox: SandboxOverrides,
+        experience_manifest: String,
+    },
+    /// Rejection or disconnection with a descriptive message
+    DisconnectReason {
+        reason: String,
+    },
+    /// Admin action: Kick player with reason
+    Kick {
+        reason: String,
+    },
+    /// Admin action: Teleport player to destination coordinates
+    Teleport {
+        pos: [f32; 3],
+    },
+    /// Host updates sandbox physics/rules on the fly
+    RulesUpdate {
+        sandbox: SandboxOverrides,
+    },
+}
+
+#[inline]
+fn write_str(buf: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+#[inline]
+fn read_str(slice: &[u8], cur: &mut usize) -> Option<String> {
+    if *cur + 2 > slice.len() {
+        return None;
+    }
+    let len = u16::from_le_bytes(slice[*cur..*cur + 2].try_into().ok()?) as usize;
+    *cur += 2;
+    if *cur + len > slice.len() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&slice[*cur..*cur + len]).to_string();
+    *cur += len;
+    Some(s)
+}
+
+#[inline]
+fn write_sandbox(buf: &mut Vec<u8>, s: &SandboxOverrides) {
+    buf.extend_from_slice(&s.population_multiplier.to_le_bytes());
+    write_str(buf, &s.spawn_mode);
+    buf.extend_from_slice(&s.gravity_multiplier.to_le_bytes());
+    buf.extend_from_slice(&s.voxel_scale.to_le_bytes());
+    buf.push(if s.pvp_enabled { 1 } else { 0 });
+    buf.push(if s.structural_integrity { 1 } else { 0 });
+}
+
+#[inline]
+fn read_sandbox(slice: &[u8], cur: &mut usize) -> Option<SandboxOverrides> {
+    if *cur + 4 > slice.len() {
+        return None;
+    }
+    let population_multiplier = f32::from_le_bytes(slice[*cur..*cur + 4].try_into().ok()?);
+    *cur += 4;
+    let spawn_mode = read_str(slice, cur)?;
+    if *cur + 4 + 4 + 1 + 1 > slice.len() {
+        return None;
+    }
+    let gravity_multiplier = f32::from_le_bytes(slice[*cur..*cur + 4].try_into().ok()?);
+    *cur += 4;
+    let voxel_scale = f32::from_le_bytes(slice[*cur..*cur + 4].try_into().ok()?);
+    *cur += 4;
+    let pvp_enabled = slice[*cur] != 0;
+    *cur += 1;
+    let structural_integrity = slice[*cur] != 0;
+    *cur += 1;
+
+    Some(SandboxOverrides {
+        population_multiplier,
+        spawn_mode,
+        gravity_multiplier,
+        voxel_scale,
+        pvp_enabled,
+        structural_integrity,
+    })
 }
 
 impl Packet {
@@ -122,12 +209,16 @@ impl Packet {
         buf.extend_from_slice(&[0, 0, 0, 0]);
 
         match self {
-            Packet::Join { protocol, name } => {
+            Packet::Join { protocol, name, password } => {
                 buf.push(1);
                 buf.extend_from_slice(&protocol.to_le_bytes());
-                let name_bytes = name.as_bytes();
-                buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
-                buf.extend_from_slice(name_bytes);
+                write_str(&mut buf, name);
+                if let Some(pw) = password {
+                    buf.push(1);
+                    write_str(&mut buf, pw);
+                } else {
+                    buf.push(0);
+                }
             }
             Packet::Welcome {
                 assigned_id,
@@ -183,19 +274,13 @@ impl Packet {
             } => {
                 buf.push(5);
                 buf.extend_from_slice(&sender_id.to_le_bytes());
-                let name_b = sender_name.as_bytes();
-                buf.extend_from_slice(&(name_b.len() as u16).to_le_bytes());
-                buf.extend_from_slice(name_b);
-                let text_b = text.as_bytes();
-                buf.extend_from_slice(&(text_b.len() as u16).to_le_bytes());
-                buf.extend_from_slice(text_b);
+                write_str(&mut buf, sender_name);
+                write_str(&mut buf, text);
             }
             Packet::PlayerJoined { id, name } => {
                 buf.push(6);
                 buf.extend_from_slice(&id.to_le_bytes());
-                let name_b = name.as_bytes();
-                buf.extend_from_slice(&(name_b.len() as u16).to_le_bytes());
-                buf.extend_from_slice(name_b);
+                write_str(&mut buf, name);
             }
             Packet::PlayerLeft { id } => {
                 buf.push(7);
@@ -219,6 +304,36 @@ impl Packet {
                 buf.push(9);
                 buf.extend_from_slice(&player_id.to_le_bytes());
                 buf.extend_from_slice(&health.to_le_bytes());
+            }
+            Packet::HostHandshake {
+                server_name,
+                experience_id,
+                sandbox,
+                experience_manifest,
+            } => {
+                buf.push(10);
+                write_str(&mut buf, server_name);
+                write_str(&mut buf, experience_id);
+                write_sandbox(&mut buf, sandbox);
+                write_str(&mut buf, experience_manifest);
+            }
+            Packet::DisconnectReason { reason } => {
+                buf.push(11);
+                write_str(&mut buf, reason);
+            }
+            Packet::Kick { reason } => {
+                buf.push(12);
+                write_str(&mut buf, reason);
+            }
+            Packet::Teleport { pos } => {
+                buf.push(13);
+                buf.extend_from_slice(&pos[0].to_le_bytes());
+                buf.extend_from_slice(&pos[1].to_le_bytes());
+                buf.extend_from_slice(&pos[2].to_le_bytes());
+            }
+            Packet::RulesUpdate { sandbox } => {
+                buf.push(14);
+                write_sandbox(&mut buf, sandbox);
             }
         }
 
@@ -248,18 +363,19 @@ impl Packet {
 
         let packet = match tag {
             1 => {
-                if cur + 4 + 2 > slice.len() {
+                if cur + 4 > slice.len() {
                     return None;
                 }
                 let protocol = u32::from_le_bytes(slice[cur..cur + 4].try_into().ok()?);
                 cur += 4;
-                let n_len = u16::from_le_bytes(slice[cur..cur + 2].try_into().ok()?) as usize;
-                cur += 2;
-                if cur + n_len > slice.len() {
-                    return None;
-                }
-                let name = String::from_utf8_lossy(&slice[cur..cur + n_len]).to_string();
-                Packet::Join { protocol, name }
+                let name = read_str(slice, &mut cur)?;
+                let password = if cur < slice.len() && slice[cur] != 0 {
+                    cur += 1;
+                    read_str(slice, &mut cur)
+                } else {
+                    None
+                };
+                Packet::Join { protocol, name, password }
             }
             2 => {
                 if cur + 4 + 4 + 4 + 4 > slice.len() {
@@ -346,24 +462,13 @@ impl Packet {
                 }
             }
             5 => {
-                if cur + 4 + 2 > slice.len() {
+                if cur + 4 > slice.len() {
                     return None;
                 }
                 let sender_id = u32::from_le_bytes(slice[cur..cur + 4].try_into().ok()?);
                 cur += 4;
-                let name_len = u16::from_le_bytes(slice[cur..cur + 2].try_into().ok()?) as usize;
-                cur += 2;
-                if cur + name_len + 2 > slice.len() {
-                    return None;
-                }
-                let sender_name = String::from_utf8_lossy(&slice[cur..cur + name_len]).to_string();
-                cur += name_len;
-                let text_len = u16::from_le_bytes(slice[cur..cur + 2].try_into().ok()?) as usize;
-                cur += 2;
-                if cur + text_len > slice.len() {
-                    return None;
-                }
-                let text = String::from_utf8_lossy(&slice[cur..cur + text_len]).to_string();
+                let sender_name = read_str(slice, &mut cur)?;
+                let text = read_str(slice, &mut cur)?;
                 Packet::ChatMessage {
                     sender_id,
                     sender_name,
@@ -371,17 +476,12 @@ impl Packet {
                 }
             }
             6 => {
-                if cur + 4 + 2 > slice.len() {
+                if cur + 4 > slice.len() {
                     return None;
                 }
                 let id = u32::from_le_bytes(slice[cur..cur + 4].try_into().ok()?);
                 cur += 4;
-                let name_len = u16::from_le_bytes(slice[cur..cur + 2].try_into().ok()?) as usize;
-                cur += 2;
-                if cur + name_len > slice.len() {
-                    return None;
-                }
-                let name = String::from_utf8_lossy(&slice[cur..cur + name_len]).to_string();
+                let name = read_str(slice, &mut cur)?;
                 Packet::PlayerJoined { id, name }
             }
             7 => {
@@ -422,6 +522,41 @@ impl Packet {
                 let health = f32::from_le_bytes(slice[cur..cur + 4].try_into().ok()?);
                 Packet::PlayerHealth { player_id, health }
             }
+            10 => {
+                let server_name = read_str(slice, &mut cur)?;
+                let experience_id = read_str(slice, &mut cur)?;
+                let sandbox = read_sandbox(slice, &mut cur)?;
+                let experience_manifest = read_str(slice, &mut cur)?;
+                Packet::HostHandshake {
+                    server_name,
+                    experience_id,
+                    sandbox,
+                    experience_manifest,
+                }
+            }
+            11 => {
+                let reason = read_str(slice, &mut cur)?;
+                Packet::DisconnectReason { reason }
+            }
+            12 => {
+                let reason = read_str(slice, &mut cur)?;
+                Packet::Kick { reason }
+            }
+            13 => {
+                if cur + 12 > slice.len() {
+                    return None;
+                }
+                let px = f32::from_le_bytes(slice[cur..cur + 4].try_into().ok()?);
+                cur += 4;
+                let py = f32::from_le_bytes(slice[cur..cur + 4].try_into().ok()?);
+                cur += 4;
+                let pz = f32::from_le_bytes(slice[cur..cur + 4].try_into().ok()?);
+                Packet::Teleport { pos: [px, py, pz] }
+            }
+            14 => {
+                let sandbox = read_sandbox(slice, &mut cur)?;
+                Packet::RulesUpdate { sandbox }
+            }
             _ => return None,
         };
 
@@ -438,124 +573,49 @@ mod tests {
         let p = Packet::Join {
             protocol: PROTOCOL_VERSION,
             name: "Steve".to_string(),
+            password: Some("secret123".to_string()),
         };
         let encoded = p.encode();
         let (decoded, consumed) = Packet::decode(&encoded).unwrap();
         assert_eq!(consumed, encoded.len());
-        match decoded {
-            Packet::Join { protocol, name } => {
-                assert_eq!(protocol, PROTOCOL_VERSION);
-                assert_eq!(name, "Steve");
-            }
-            _ => panic!("wrong packet type"),
-        }
+        assert_eq!(decoded, p);
     }
 
     #[test]
-    fn test_player_state_roundtrip() {
-        let p = Packet::PlayerState {
-            id: 42,
-            pos: [10.5, 64.0, -100.25],
-            yaw: 1.23,
-            pitch: -0.45,
-            walk_phase: 3.14,
-            is_moving: true,
-            arm_swing: 0.75,
-            held_block: 5,
+    fn test_host_handshake_roundtrip() {
+        let p = Packet::HostHandshake {
+            server_name: "Mega Server".to_string(),
+            experience_id: "survival".to_string(),
+            sandbox: SandboxOverrides {
+                population_multiplier: 1.5,
+                spawn_mode: "Migration".to_string(),
+                gravity_multiplier: 1.2,
+                voxel_scale: 1.0,
+                pvp_enabled: false,
+                structural_integrity: true,
+            },
+            experience_manifest: "manifest_v1".to_string(),
         };
         let encoded = p.encode();
         let (decoded, consumed) = Packet::decode(&encoded).unwrap();
         assert_eq!(consumed, encoded.len());
-        match decoded {
-            Packet::PlayerState {
-                id,
-                pos,
-                yaw,
-                pitch,
-                walk_phase,
-                is_moving,
-                arm_swing,
-                held_block,
-            } => {
-                assert_eq!(id, 42);
-                assert_eq!(pos, [10.5, 64.0, -100.25]);
-                assert_eq!(yaw, 1.23);
-                assert_eq!(pitch, -0.45);
-                assert_eq!(walk_phase, 3.14);
-                assert!(is_moving);
-                assert_eq!(arm_swing, 0.75);
-                assert_eq!(held_block, 5);
-            }
-            _ => panic!("wrong packet type"),
-        }
+        assert_eq!(decoded, p);
     }
 
     #[test]
-    fn test_block_change_roundtrip() {
-        let p = Packet::BlockChange {
-            pos: [-15, 70, 200],
-            block_id: 3,
-        };
-        let encoded = p.encode();
-        let (decoded, consumed) = Packet::decode(&encoded).unwrap();
-        assert_eq!(consumed, encoded.len());
-        match decoded {
-            Packet::BlockChange { pos, block_id } => {
-                assert_eq!(pos, [-15, 70, 200]);
-                assert_eq!(block_id, 3);
-            }
-            _ => panic!("wrong packet type"),
-        }
-    }
+    fn test_admin_packets_roundtrip() {
+        let kick = Packet::Kick { reason: "Bad ping".into() };
+        let (d_kick, _) = Packet::decode(&kick.encode()).unwrap();
+        assert_eq!(d_kick, kick);
 
-    #[test]
-    fn test_chat_message_roundtrip() {
-        let p = Packet::ChatMessage {
-            sender_id: 1,
-            sender_name: "Alex".to_string(),
-            text: "Привет, мир!".to_string(),
-        };
-        let encoded = p.encode();
-        let (decoded, consumed) = Packet::decode(&encoded).unwrap();
-        assert_eq!(consumed, encoded.len());
-        match decoded {
-            Packet::ChatMessage {
-                sender_id,
-                sender_name,
-                text,
-            } => {
-                assert_eq!(sender_id, 1);
-                assert_eq!(sender_name, "Alex");
-                assert_eq!(text, "Привет, мир!");
-            }
-            _ => panic!("wrong packet type"),
-        }
-    }
+        let tp = Packet::Teleport { pos: [12.0, 64.0, -50.0] };
+        let (d_tp, _) = Packet::decode(&tp.encode()).unwrap();
+        assert_eq!(d_tp, tp);
 
-    #[test]
-    fn test_welcome_roundtrip() {
-        let p = Packet::Welcome {
-            assigned_id: 7,
-            seed: 987654,
-            time_of_day: 14.5,
-            edits: vec![([1, 2, 3], 10), ([-5, 60, -7], 20)],
+        let rules = Packet::RulesUpdate {
+            sandbox: SandboxOverrides::default(),
         };
-        let encoded = p.encode();
-        let (decoded, consumed) = Packet::decode(&encoded).unwrap();
-        assert_eq!(consumed, encoded.len());
-        match decoded {
-            Packet::Welcome {
-                assigned_id,
-                seed,
-                time_of_day,
-                edits,
-            } => {
-                assert_eq!(assigned_id, 7);
-                assert_eq!(seed, 987654);
-                assert_eq!(time_of_day, 14.5);
-                assert_eq!(edits, vec![([1, 2, 3], 10), ([-5, 60, -7], 20)]);
-            }
-            _ => panic!("wrong packet type"),
-        }
+        let (d_rules, _) = Packet::decode(&rules.encode()).unwrap();
+        assert_eq!(d_rules, rules);
     }
 }

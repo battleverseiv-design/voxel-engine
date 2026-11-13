@@ -5,6 +5,7 @@ pub use materials::*;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use serde::{Deserialize, Serialize};
 
 use glam::{IVec3, Quat, Vec3};
 
@@ -656,6 +657,82 @@ impl Default for SimulationRules {
         }
     }
 }
+
+impl SimulationRules {
+    /// Applies sandbox overrides from a server host profile to the simulation rules.
+    pub fn apply_sandbox(&mut self, overrides: &SandboxOverrides) {
+        self.gravity = Vec3::new(0.0, -9.81 * overrides.gravity_multiplier.clamp(0.05, 10.0), 0.0);
+        self.voxel_scale = overrides.voxel_scale.clamp(0.1, 4.0);
+        self.structural_integrity = overrides.structural_integrity;
+    }
+}
+
+/// Granular sandbox overrides defined by the server host (Project Zomboid style).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SandboxOverrides {
+    /// Multiplier for NPC / mob / creature spawning density (0.1x .. 5.0x).
+    pub population_multiplier: f32,
+    /// Spawning behavior rules ("Safe", "Migration", "Hardcore", "NoRespawnCleaned").
+    pub spawn_mode: String,
+    /// Multiplier for global gravity acceleration (default 1.0x).
+    pub gravity_multiplier: f32,
+    /// Physical block and collision grid scale factor (default 1.0x).
+    pub voxel_scale: f32,
+    /// Whether player vs player damage is permitted.
+    pub pvp_enabled: bool,
+    /// Whether voxel structural load and collapse evaluation is enabled.
+    pub structural_integrity: bool,
+}
+
+impl Default for SandboxOverrides {
+    fn default() -> Self {
+        Self {
+            population_multiplier: 1.0,
+            spawn_mode: "Migration".to_string(),
+            gravity_multiplier: 1.0,
+            voxel_scale: 1.0,
+            pvp_enabled: true,
+            structural_integrity: false,
+        }
+    }
+}
+
+/// Persistent profile configuration for hosting dedicated co-op servers.
+/// Saved on disk at `server_profiles/<profile_name>/server_settings.toml`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServerHostProfile {
+    // --- Network parameters ---
+    pub server_name: String,
+    pub port: u16,
+    pub max_players: u16,
+    pub password: Option<String>,
+    pub public_lan_announce: bool,
+
+    // --- Mode & Map ---
+    pub experience_id: String,
+    pub world_seed: u64,
+    pub save_folder_name: String,
+
+    // --- Sandbox & Simulation Rules ---
+    pub sandbox: SandboxOverrides,
+}
+
+impl Default for ServerHostProfile {
+    fn default() -> Self {
+        Self {
+            server_name: "Voxel Dedicated Co-op".to_string(),
+            port: 25565,
+            max_players: 8,
+            password: None,
+            public_lan_announce: true,
+            experience_id: "survival".to_string(),
+            world_seed: 42,
+            save_folder_name: "server_world".to_string(),
+            sandbox: SandboxOverrides::default(),
+        }
+    }
+}
+
 
 /// Entry interface for pluggable game modes running on top of the engine.
 pub trait GameMode: Send + Sync {

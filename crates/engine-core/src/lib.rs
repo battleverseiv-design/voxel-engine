@@ -906,6 +906,61 @@ pub struct PointLight {
     pub intensity: f32,
 }
 
+/// Configures physical locomotion properties for an entity or game mode.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MovementConfig {
+    pub walk_speed: f32,
+    pub sprint_speed: f32,
+    pub crouch_speed: f32,
+    pub fly_speed: f32,
+    pub ground_acceleration: f32,
+    pub air_acceleration: f32,
+    pub ground_friction: f32,
+    pub gravity: f32,
+    pub jump_impulse: f32,
+    pub step_height: f32,
+    pub standing_height: f32,
+    pub crouching_height: f32,
+    pub collider_radius: f32,
+    pub coyote_time_sec: f32,
+    pub jump_buffer_sec: f32,
+}
+
+impl Default for MovementConfig {
+    fn default() -> Self {
+        Self {
+            walk_speed: 4.5,
+            sprint_speed: 6.8,
+            crouch_speed: 2.4,
+            fly_speed: 10.0,
+            ground_acceleration: 45.0,
+            air_acceleration: 12.0,
+            ground_friction: 10.0,
+            gravity: 24.0,
+            jump_impulse: 8.4,
+            step_height: 0.55,
+            standing_height: 1.80,
+            crouching_height: 1.15,
+            collider_radius: 0.30,
+            coyote_time_sec: 0.12,
+            jump_buffer_sec: 0.12,
+        }
+    }
+}
+
+/// Dynamic locomotion states for character physics and animation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LocomotionState {
+    #[default]
+    Grounded,
+    Airborne,
+    Crouching,
+    Sprinting,
+    Sliding,
+    FlyingNoclip,
+    Swimming,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

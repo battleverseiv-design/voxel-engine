@@ -101,7 +101,7 @@ fn push_box(
     }
 }
 
-/// Builds dynamic low-poly avatar mesh in Unturned / stylized survivor style.
+/// Builds dynamic low-poly avatar mesh with procedural stance and speed blending.
 pub fn build_avatar_mesh(
     avatar: &AvatarModel,
     feet_pos: Vec3,
@@ -109,6 +109,10 @@ pub fn build_avatar_mesh(
     pitch: f32,
     walk_phase: f32,
     is_moving: bool,
+    horizontal_speed: f32,
+    is_crouching: bool,
+    is_in_air: bool,
+    is_swimming: bool,
     held_block_colors: Option<[[f32; 3]; 6]>,
 ) -> Vec<VoxelVertex> {
     let mut vertices = Vec::with_capacity(300);
@@ -131,17 +135,42 @@ pub fn build_avatar_mesh(
     let body_right = Vec3::new(cos_y, 0.0, sin_y).normalize();
     let body_up = Vec3::Y;
 
-    // Body rotation matrix
-    let body_rot = Mat3::from_cols(body_right, body_up, -body_forward);
+    // Body rotation matrix with stance adaptations
+    let mut body_rot = Mat3::from_cols(body_right, body_up, -body_forward);
 
-    // Leg & arm swing angle from walk cycle (opposite arm to leg)
-    let swing_amp = if is_moving { 0.62 } else { 0.0 };
-    let leg_swing = (walk_phase).sin() * swing_amp;
-    let left_arm_swing = -leg_swing;
-    let right_arm_swing = leg_swing;
+    if is_swimming {
+        // Horizontal swimming posture
+        body_rot = body_rot * Mat3::from_rotation_x(-1.25);
+    } else if is_crouching {
+        // Forward torso tilt when crouching
+        body_rot = body_rot * Mat3::from_rotation_x(0.32);
+    }
+
+    // Speed-based swing amplitude blending
+    let speed_ratio = (horizontal_speed / 5.2).clamp(0.0, 1.5);
+    let swing_amp = if is_moving {
+        0.58 * speed_ratio.max(0.35)
+    } else {
+        0.0
+    };
+
+    let (leg_swing, left_arm_swing, right_arm_swing) = if is_swimming {
+        let kick = (walk_phase * 1.5).sin() * 0.45;
+        (kick, -kick * 0.8, kick * 0.8)
+    } else if is_in_air {
+        // Airborne jump / fall pose
+        (0.22, -0.45, -0.45)
+    } else {
+        let leg = (walk_phase).sin() * swing_amp;
+        (leg, -leg, leg)
+    };
+
+    // Stance height adjustments
+    let height_drop = if is_crouching { 0.38 } else { 0.0 };
+    let base_feet = feet_pos - body_up * height_drop;
 
     // 1. Torso (0.44 wide, 0.62 tall, 0.24 deep)
-    let torso_center = feet_pos + body_up * 1.02;
+    let torso_center = base_feet + body_up * 1.02;
     push_box(
         &mut vertices,
         torso_center,
@@ -151,8 +180,9 @@ pub fn build_avatar_mesh(
     );
 
     // 2. Left Leg (pivot at hip y = 0.71)
-    let left_hip = feet_pos + body_up * 0.71 - body_right * 0.11;
-    let left_leg_rot = body_rot * Mat3::from_rotation_x(leg_swing);
+    let left_hip = base_feet + body_up * 0.71 - body_right * 0.11;
+    let crouch_leg_angle = if is_crouching { -0.52 } else { 0.0 };
+    let left_leg_rot = body_rot * Mat3::from_rotation_x(leg_swing + crouch_leg_angle);
     let left_leg_center = left_hip + left_leg_rot * Vec3::new(0.0, -0.355, 0.0);
     push_box(
         &mut vertices,
@@ -163,8 +193,8 @@ pub fn build_avatar_mesh(
     );
 
     // 3. Right Leg (pivot at hip y = 0.71)
-    let right_hip = feet_pos + body_up * 0.71 + body_right * 0.11;
-    let right_leg_rot = body_rot * Mat3::from_rotation_x(-leg_swing);
+    let right_hip = base_feet + body_up * 0.71 + body_right * 0.11;
+    let right_leg_rot = body_rot * Mat3::from_rotation_x(-leg_swing + crouch_leg_angle);
     let right_leg_center = right_hip + right_leg_rot * Vec3::new(0.0, -0.355, 0.0);
     push_box(
         &mut vertices,
@@ -175,8 +205,11 @@ pub fn build_avatar_mesh(
     );
 
     // 4. Left Arm (pivot at shoulder y = 1.25)
-    let left_shoulder = feet_pos + body_up * 1.25 - body_right * 0.32;
-    let left_arm_rot = body_rot * Mat3::from_rotation_x(left_arm_swing);
+    let left_shoulder = base_feet + body_up * 1.25 - body_right * 0.32;
+    let left_air_spread = if is_in_air { 0.30 } else { 0.0 };
+    let left_arm_rot = body_rot
+        * Mat3::from_rotation_z(left_air_spread)
+        * Mat3::from_rotation_x(left_arm_swing);
     let left_arm_center = left_shoulder + left_arm_rot * Vec3::new(0.0, -0.28, 0.0);
     push_box(
         &mut vertices,
@@ -187,13 +220,16 @@ pub fn build_avatar_mesh(
     );
 
     // 5. Right Arm (pivot at shoulder y = 1.25)
-    let right_shoulder = feet_pos + body_up * 1.25 + body_right * 0.32;
+    let right_shoulder = base_feet + body_up * 1.25 + body_right * 0.32;
+    let right_air_spread = if is_in_air { -0.30 } else { 0.0 };
     let right_arm_angle = if held_block_colors.is_some() {
         0.55 - right_arm_swing * 0.25
     } else {
         right_arm_swing
     };
-    let right_arm_rot = body_rot * Mat3::from_rotation_x(right_arm_angle);
+    let right_arm_rot = body_rot
+        * Mat3::from_rotation_z(right_air_spread)
+        * Mat3::from_rotation_x(right_arm_angle);
     let right_arm_center = right_shoulder + right_arm_rot * Vec3::new(0.0, -0.28, 0.0);
     push_box(
         &mut vertices,
@@ -216,7 +252,7 @@ pub fn build_avatar_mesh(
     }
 
     // 7. Head (pivot at neck y = 1.34)
-    let neck_pos = feet_pos + body_up * 1.34;
+    let neck_pos = base_feet + body_up * 1.34;
     let head_rot = body_rot * Mat3::from_rotation_x(pitch);
     let head_center = neck_pos + head_rot * Vec3::new(0.0, 0.21, 0.0);
     push_box(
@@ -274,7 +310,7 @@ pub fn build_avatar_mesh(
     vertices
 }
 
-/// Builds the first-person arm and held item mesh with walking bob and swing animation.
+/// Builds the first-person arm and held item mesh with walking bob, swing, and weapon sway.
 pub fn build_first_person_arm_mesh(
     avatar: &AvatarModel,
     camera_pos: Vec3,
@@ -283,6 +319,7 @@ pub fn build_first_person_arm_mesh(
     walk_phase: f32,
     is_moving: bool,
     swing_progress: f32,
+    sway_offset: Vec3,
     held_block_colors: Option<[[f32; 3]; 6]>,
 ) -> Vec<VoxelVertex> {
     let mut vertices = Vec::with_capacity(120);
@@ -313,20 +350,18 @@ pub fn build_first_person_arm_mesh(
     let bob_x = (walk_phase * 0.5).sin() * 0.010 * bob_amp;
     let bob_y = (walk_phase).sin().abs() * 0.008 * bob_amp;
 
-    // Shoulder anchor pinned to bottom-right of viewport (elbow stays back, fist swings forward)
+    // Shoulder anchor pinned to bottom-right of viewport with weapon sway offset
     let shoulder_pos = camera_pos
-        + cam_right * (0.28 + bob_x)
-        + cam_up * (-0.26 - bob_y)
-        + cam_fwd * 0.14;
+        + cam_right * (0.28 + bob_x + sway_offset.x)
+        + cam_up * (-0.26 - bob_y + sway_offset.y)
+        + cam_fwd * (0.14 + sway_offset.z);
 
     // Snappy swing interpolation (Minecraft style sqrt curve for snappy downward chop)
     let p = swing_progress.clamp(0.0, 1.0);
     let s_fast = (p.sqrt() * std::f32::consts::PI).sin();
     let s_full = (p * std::f32::consts::PI).sin();
 
-    // Rotations around shoulder pivot:
-    // Rest pose: arm extends forward-upward towards center
-    // Swing pose: snappy downward chop (pitch), slight inward swing (yaw), wrist tilt (roll)
+    // Rotations around shoulder pivot
     let rest_pitch = 0.28;
     let rest_yaw = -0.18;
     let rest_roll = 0.12;

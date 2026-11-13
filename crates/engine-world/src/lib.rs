@@ -14,6 +14,12 @@ use engine_core::{
 use glam::{IVec3, Vec3};
 use rayon::prelude::*;
 
+pub mod character_controller;
+pub use character_controller::{
+    check_aabb_collision, to_voxel_pos, CharacterController, ControllerInput,
+    ControllerOutput, StepType,
+};
+
 pub const CHUNK_SIZE: usize = 16;
 pub const CHUNK_SIZE_I32: i32 = CHUNK_SIZE as i32;
 pub const CHUNK_VOLUME: usize = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE; // 4096

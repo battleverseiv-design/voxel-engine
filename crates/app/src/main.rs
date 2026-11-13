@@ -10,15 +10,18 @@ use std::time::Instant;
 
 use engine_core::{
     AvatarModel, BlockId, BlockRegistry, CommandHost, CommandRegistry, EnvironmentProvider,
-    GameMode, Inventory, ItemStack, MaterialRegistry, PlayerMode, ReferenceFrameId,
-    RelativeTransform, ServerHostProfile, WorldGenerator,
+    GameMode, Inventory, ItemStack, MaterialRegistry, MovementConfig,
+    PlayerMode, ReferenceFrameId, RelativeTransform, ServerHostProfile, WorldGenerator,
 };
 use engine_net::{
     ClientEvent, DiscoveryBeacon, DiscoveryScanner, GameClient, HostEvent,
     Packet, RemotePlayer, ServerHost, DEFAULT_PORT,
 };
 use engine_render::{build_avatar_mesh, build_first_person_arm_mesh, Camera, RenderError, Renderer};
-use engine_world::{world_to_chunk, VoxelContraption, World, WorldStreamer, CHUNK_SIZE_I32};
+use engine_world::{
+    world_to_chunk, CharacterController, ControllerInput, StepType,
+    VoxelContraption, World, WorldStreamer, CHUNK_SIZE_I32,
+};
 use game_survival::{LithosphereWorldGen, SurvivalMode};
 use glam::{IVec3, Vec3};
 use settings::{keycode_to_name, name_to_keycode, Settings};
@@ -140,6 +143,9 @@ struct EngineApp {
     target_pitch: f32,
     velocity: Vec3,
     on_ground: bool,
+    controller: CharacterController,
+    jump_just_pressed: bool,
+    hand_sway: Vec3,
     player_mode: PlayerMode,
     fly_mode: bool,
     allow_fly: bool,
@@ -206,7 +212,6 @@ struct EngineApp {
     last_hitmarker: Option<(Instant, bool, f32)>,
     camera_flinch: f32,
     death_fall_progress: f32,
-    step_timer: f32,
     last_regen_sync: Instant,
     // ===== [TEMPORARY PHYSICS TEST: START] =====
     test_physics_blocks: Vec<VoxelContraption>,
@@ -358,6 +363,7 @@ impl EngineApp {
         let commands = Arc::new(commands);
 
         let now = Instant::now();
+        let controller = CharacterController::new(initial_spawn, MovementConfig::default());
         let mut app = Self {
             mode,
             registry,
@@ -371,6 +377,9 @@ impl EngineApp {
             camera,
             velocity: Vec3::ZERO,
             on_ground: false,
+            controller,
+            jump_just_pressed: false,
+            hand_sway: Vec3::ZERO,
             player_mode: PlayerMode::Survival,
             fly_mode: false,
             allow_fly: false,
@@ -437,7 +446,6 @@ impl EngineApp {
             last_hitmarker: None,
             camera_flinch: 0.0,
             death_fall_progress: 0.0,
-            step_timer: 0.0,
             last_regen_sync: now,
             // ===== [TEMPORARY PHYSICS TEST: START] =====
             test_physics_blocks: Vec::new(),
@@ -538,11 +546,14 @@ impl EngineApp {
     }
 
     fn player_feet(&self) -> Vec3 {
-        self.camera.position - Vec3::Y * PLAYER_EYE_HEIGHT
+        self.controller.position
     }
 
     fn set_player_feet(&mut self, feet: Vec3) {
-        self.camera.position = feet + Vec3::Y * PLAYER_EYE_HEIGHT;
+        self.controller.position = feet;
+        self.controller.velocity = Vec3::ZERO;
+        self.camera.position = feet + Vec3::Y * (self.controller.config.standing_height * 0.90);
+        self.player_pos = feet;
     }
 
     fn set_cursor_lock(&mut self, lock: bool) {
@@ -629,6 +640,10 @@ impl EngineApp {
 
         let spawn = Vec3::from_array(meta.player_pos);
         self.player_pos = spawn;
+        self.controller.position = spawn;
+        self.controller.velocity = Vec3::ZERO;
+        self.controller.on_ground = false;
+        self.controller.smoothed_eye_y = spawn.y + self.controller.config.standing_height * 0.90;
         self.camera.position = spawn;
         self.camera.yaw = meta.player_yaw;
         self.camera.pitch = meta.player_pitch;
@@ -965,6 +980,13 @@ impl EngineApp {
             self.target_yaw += dx * sens;
             self.target_pitch = (self.target_pitch - dy * sens * y_sign).clamp(-1.54, 1.54);
 
+            let target_sway_x = (-dx * 0.00035).clamp(-0.06, 0.06);
+            let target_sway_y = (dy * 0.00035).clamp(-0.06, 0.06);
+            let sway_rate = (15.0 * dt).min(1.0);
+            self.hand_sway.x += (target_sway_x - self.hand_sway.x) * sway_rate;
+            self.hand_sway.y += (target_sway_y - self.hand_sway.y) * sway_rate;
+            self.hand_sway *= (1.0 - 5.0 * dt).max(0.0);
+
             if self.settings.mouse_smoothing <= 0.001 {
                 self.camera.yaw = self.target_yaw;
                 self.camera.pitch = self.target_pitch;
@@ -1029,55 +1051,103 @@ impl EngineApp {
             wish_xz = wish_xz.normalize_or_zero();
 
             let sprinting = self.input.is_bound_down(&self.settings.keybinds.sprint);
-            if self.fly_mode {
-                let mut move_dir = wish_xz;
-                if self.input.is_bound_down(&self.settings.keybinds.jump_up) {
-                    move_dir.y += 1.0;
-                }
-                if self.input.is_bound_down(&self.settings.keybinds.down) {
-                    move_dir.y -= 1.0;
-                }
-                let speed = if sprinting {
-                    self.settings.fly_speed * 2.2
-                } else {
-                    self.settings.fly_speed
+            let crouching = self.input.is_bound_down(&self.settings.keybinds.down);
+            let jump_held = self.input.is_bound_down(&self.settings.keybinds.jump_up);
+            let jump_pressed = self.jump_just_pressed;
+            self.jump_just_pressed = false;
+
+            let ctrl_input = ControllerInput {
+                wish_dir: wish_xz,
+                jump: jump_held,
+                jump_pressed,
+                sprint: sprinting,
+                crouch: crouching,
+                fly: self.fly_mode,
+                fly_up: jump_held,
+                fly_down: crouching,
+                fly_speed_multiplier: if sprinting { 2.2 } else { 1.0 },
+                look_yaw: self.camera.yaw,
+            };
+
+            let out = self.controller.step(
+                &ctrl_input,
+                &self.world,
+                &self.registry,
+                &self.materials,
+                dt,
+                1.0,
+            );
+
+            self.player_pos = out.position;
+            self.velocity = out.velocity;
+            self.on_ground = out.on_ground;
+            self.camera.position = out.eye_position;
+            self.camera.roll = out.strafe_roll;
+
+            // Handle step sounds
+            if let Some(step) = out.step_event {
+                let effect = match step {
+                    StepType::WaterSwim | StepType::WaterSplash => audio::SoundEffect::Footstep,
+                    StepType::Footstep(block_id) => {
+                        if let Some(def) = self.registry.get(block_id) {
+                            let name = def.name.to_lowercase();
+                            if name.contains("grass") {
+                                audio::SoundEffect::FootstepGrass
+                            } else if name.contains("stone")
+                                || name.contains("cobble")
+                                || name.contains("brick")
+                                || name.contains("andesite")
+                                || name.contains("furnace")
+                            {
+                                audio::SoundEffect::FootstepStone
+                            } else if name.contains("wood")
+                                || name.contains("planks")
+                                || name.contains("bookshelf")
+                                || name.contains("crafting")
+                            {
+                                audio::SoundEffect::FootstepWood
+                            } else if name.contains("sand") {
+                                audio::SoundEffect::FootstepSand
+                            } else if name.contains("gravel") {
+                                audio::SoundEffect::FootstepGravel
+                            } else if name.contains("dirt") {
+                                audio::SoundEffect::FootstepDirt
+                            } else if name.contains("leaves") {
+                                audio::SoundEffect::FootstepLeaves
+                            } else {
+                                audio::SoundEffect::Footstep
+                            }
+                        } else {
+                            audio::SoundEffect::FootstepGrass
+                        }
+                    }
                 };
-                self.camera.position += move_dir.normalize_or_zero() * speed * dt;
-                self.velocity = Vec3::ZERO;
-            } else {
-                let speed = if sprinting { 8.5 } else { 5.4 };
-                self.velocity.x = wish_xz.x * speed;
-                self.velocity.z = wish_xz.z * speed;
-                self.velocity.y -= 24.0 * dt;
-
-                if self.on_ground && self.input.is_bound_down(&self.settings.keybinds.jump_up) {
-                    self.velocity.y = 8.4;
-                    self.on_ground = false;
-                }
-
-                let feet = self.player_feet();
-                let (new_feet, landed) =
-                    move_with_collision(&self.world, &self.registry, feet, self.velocity * dt);
-                if landed && self.velocity.y < 0.0 {
-                    self.velocity.y = 0.0;
-                } else if new_feet.y == feet.y && self.velocity.y > 0.0 {
-                    self.velocity.y = 0.0;
-                }
-                self.on_ground = landed;
-                self.set_player_feet(new_feet);
+                audio::play_sound(effect);
             }
         } else if self.health <= 0.0 && self.screen == MenuScreen::Playing && !self.fly_mode {
-            self.velocity.x = 0.0;
-            self.velocity.z = 0.0;
-            self.velocity.y -= 24.0 * dt;
-            let feet = self.player_feet();
-            let (new_feet, landed) =
-                move_with_collision(&self.world, &self.registry, feet, self.velocity * dt);
-            if landed && self.velocity.y < 0.0 {
-                self.velocity.y = 0.0;
-            }
-            self.on_ground = landed;
-            self.set_player_feet(new_feet);
+            let ctrl_input = ControllerInput {
+                wish_dir: Vec3::ZERO,
+                jump: false,
+                jump_pressed: false,
+                sprint: false,
+                crouch: false,
+                fly: false,
+                fly_up: false,
+                fly_down: false,
+                fly_speed_multiplier: 1.0,
+                look_yaw: self.camera.yaw,
+            };
+            let out = self.controller.step(
+                &ctrl_input,
+                &self.world,
+                &self.registry,
+                &self.materials,
+                dt,
+                1.0,
+            );
+            self.player_pos = out.position;
+            self.velocity = out.velocity;
+            self.on_ground = out.on_ground;
         }
 
         // ===== [TEMPORARY PHYSICS TEST: START] =====
@@ -1125,68 +1195,10 @@ impl EngineApp {
 
 
         let horiz_speed = Vec3::new(self.velocity.x, 0.0, self.velocity.z).length();
-        if horiz_speed > 0.15 && (self.on_ground || self.fly_mode) {
+        if horiz_speed > 0.15 && (self.on_ground || self.fly_mode || self.controller.in_water) {
             self.walk_phase += horiz_speed * dt * 5.2;
-            if self.on_ground && self.health > 0.0 {
-                self.step_timer += dt;
-                let step_interval = if self.input.is_bound_down(&self.settings.keybinds.sprint) {
-                    0.28
-                } else {
-                    0.38
-                };
-                if self.step_timer >= step_interval {
-                    self.step_timer = 0.0;
-                    let feet = self.player_feet();
-                    let check_pos = glam::IVec3::new(
-                        feet.x.floor() as i32,
-                        (feet.y - 0.1).floor() as i32,
-                        feet.z.floor() as i32,
-                    );
-                    let mut block = self.world.get_block(check_pos);
-                    if block == engine_core::BlockId::AIR {
-                        block = self.world.get_block(glam::IVec3::new(
-                            check_pos.x,
-                            (feet.y - 0.4).floor() as i32,
-                            check_pos.z,
-                        ));
-                    }
-                    let effect = if let Some(def) = self.registry.get(block) {
-                        let name = def.name.to_lowercase();
-                        if name.contains("grass") {
-                            audio::SoundEffect::FootstepGrass
-                        } else if name.contains("stone")
-                            || name.contains("cobble")
-                            || name.contains("brick")
-                            || name.contains("andesite")
-                            || name.contains("furnace")
-                        {
-                            audio::SoundEffect::FootstepStone
-                        } else if name.contains("wood")
-                            || name.contains("planks")
-                            || name.contains("bookshelf")
-                            || name.contains("crafting")
-                        {
-                            audio::SoundEffect::FootstepWood
-                        } else if name.contains("sand") {
-                            audio::SoundEffect::FootstepSand
-                        } else if name.contains("gravel") {
-                            audio::SoundEffect::FootstepGravel
-                        } else if name.contains("dirt") {
-                            audio::SoundEffect::FootstepDirt
-                        } else if name.contains("leaves") {
-                            audio::SoundEffect::FootstepLeaves
-                        } else {
-                            audio::SoundEffect::Footstep
-                        }
-                    } else {
-                        audio::SoundEffect::FootstepGrass
-                    };
-                    audio::play_sound(effect);
-                }
-            }
         } else {
             self.walk_phase *= (1.0 - 10.0 * dt).max(0.0);
-            self.step_timer = 999.0;
         }
 
         if self.arm_swing_active {
@@ -4427,6 +4439,7 @@ impl ApplicationHandler for EngineApp {
 
                                 // Double-space in creative mode toggles flying
                                 if name_to_keycode(&self.settings.keybinds.jump_up) == Some(code) {
+                                    self.jump_just_pressed = true;
                                     let now = Instant::now();
                                     if let Some(last) = self.last_space_press {
                                         if now.duration_since(last).as_secs_f32() < 0.28 {
@@ -4611,6 +4624,10 @@ impl ApplicationHandler for EngineApp {
                             self.camera.pitch,
                             self.walk_phase,
                             horiz_speed > 0.15,
+                            horiz_speed,
+                            self.controller.is_crouching,
+                            !self.controller.on_ground && !self.controller.in_water,
+                            self.controller.in_water,
                             held_colors,
                         );
                         all_avatar_verts.extend(verts);
@@ -4624,6 +4641,7 @@ impl ApplicationHandler for EngineApp {
                             self.walk_phase,
                             horiz_speed > 0.15,
                             self.arm_swing_progress,
+                            self.hand_sway,
                             held_colors,
                         );
                         all_avatar_verts.extend(verts);
@@ -4665,6 +4683,10 @@ impl ApplicationHandler for EngineApp {
                         render_pitch,
                         if is_dead { 0.0 } else { remote.walk_phase },
                         if is_dead { false } else { remote.is_moving },
+                        if is_dead || !remote.is_moving { 0.0 } else { 4.5 },
+                        false,
+                        false,
+                        false,
                         if is_dead { None } else { held_colors },
                     );
                     if remote.hurt_timer > 0.0 || is_dead {
@@ -4803,54 +4825,6 @@ fn block_intersects_player(block: IVec3, feet: Vec3) -> bool {
         && p_max.y > b_min.y
         && p_min.z < b_max.z
         && p_max.z > b_min.z
-}
-
-fn collides_aabb(world: &World, registry: &BlockRegistry, feet: Vec3) -> bool {
-    let min_x = (feet.x - PLAYER_RADIUS).floor() as i32;
-    let max_x = (feet.x + PLAYER_RADIUS).floor() as i32;
-    let min_y = feet.y.floor() as i32;
-    let max_y = (feet.y + PLAYER_HEIGHT).floor() as i32;
-    let min_z = (feet.z - PLAYER_RADIUS).floor() as i32;
-    let max_z = (feet.z + PLAYER_RADIUS).floor() as i32;
-
-    for y in min_y..=max_y {
-        for z in min_z..=max_z {
-            for x in min_x..=max_x {
-                if registry.is_solid(world.get_block(IVec3::new(x, y, z))) {
-                    return true;
-                }
-            }
-        }
-
-    }
-    false
-}
-
-fn move_with_collision(
-    world: &World,
-    registry: &BlockRegistry,
-    mut pos: Vec3,
-    delta: Vec3,
-) -> (Vec3, bool) {
-    let next_x = Vec3::new(pos.x + delta.x, pos.y, pos.z);
-    if !collides_aabb(world, registry, next_x) {
-        pos.x = next_x.x;
-    }
-
-    let next_z = Vec3::new(pos.x, pos.y, pos.z + delta.z);
-    if !collides_aabb(world, registry, next_z) {
-        pos.z = next_z.z;
-    }
-
-    let mut landed = false;
-    let next_y = Vec3::new(pos.x, pos.y + delta.y, pos.z);
-    if !collides_aabb(world, registry, next_y) {
-        pos.y = next_y.y;
-    } else if delta.y < 0.0 {
-        landed = true;
-    }
-
-    (pos, landed)
 }
 
 fn main() {

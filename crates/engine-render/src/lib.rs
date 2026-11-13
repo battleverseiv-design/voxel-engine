@@ -41,6 +41,7 @@ pub struct Camera {
     pub position: Vec3,
     pub yaw: f32,
     pub pitch: f32,
+    pub roll: f32,
     pub fov_radians: f32,
     pub near: f32,
     pub far: f32,
@@ -52,6 +53,7 @@ impl Camera {
             position,
             yaw: 0.0,
             pitch: -0.2,
+            roll: 0.0,
             fov_radians: 75.0_f32.to_radians(),
             near: 0.1,
             far: 600.0,
@@ -76,8 +78,17 @@ impl Camera {
 
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
         let proj = Mat4::perspective_rh(self.fov_radians, aspect.max(0.01), self.near, self.far);
-        let target = self.position + self.forward();
-        let view = Mat4::look_at_rh(self.position, target, Vec3::Y);
+        let fwd = self.forward();
+        let target = self.position + fwd;
+        let up = if self.roll.abs() > 0.0001 {
+            let right = fwd.cross(Vec3::Y).normalize_or_zero();
+            let base_up = right.cross(fwd).normalize();
+            let (sin_r, cos_r) = self.roll.sin_cos();
+            (base_up * cos_r + right * sin_r).normalize()
+        } else {
+            Vec3::Y
+        };
+        let view = Mat4::look_at_rh(self.position, target, up);
         proj * view
     }
 }

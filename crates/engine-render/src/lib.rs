@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
-use engine_core::EnvironmentState;
+use engine_core::{EnvironmentState, PointLight};
 use engine_world::{ChunkMesh, VoxelVertex};
 use glam::{IVec3, Mat4, Vec3, Vec4};
 use wgpu::util::DeviceExt;
@@ -28,6 +28,9 @@ struct SceneUniform {
     ambient_sky: [f32; 4],
     ambient_ground: [f32; 4],
     sky_zenith: [f32; 4],
+    point_lights_pos: [[f32; 4]; 8],
+    point_lights_color: [[f32; 4]; 8],
+    point_light_count: [u32; 4],
 }
 
 struct GpuChunkMesh {
@@ -292,6 +295,9 @@ impl Renderer {
                 default_env.sky_zenith[2],
                 1.0,
             ],
+            point_lights_pos: [[0.0; 4]; 8],
+            point_lights_color: [[0.0; 4]; 8],
+            point_light_count: [0; 4],
         };
         let scene_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("scene-uniform"),
@@ -759,6 +765,7 @@ impl Renderer {
         fog_distance: f32,
         brightness: f32,
         environment: &EnvironmentState,
+        point_lights: &[PointLight],
         avatar_vertices: Option<&[VoxelVertex]>,
         selected_block: Option<IVec3>,
         pixels_per_point: f32,
@@ -842,6 +849,25 @@ impl Renderer {
                 environment.sky_zenith[2],
                 self.start_time.elapsed().as_secs_f32(),
             ],
+            point_lights_pos: {
+                let mut pos = [[0.0f32; 4]; 8];
+                let count = point_lights.len().min(8);
+                for i in 0..count {
+                    let pl = &point_lights[i];
+                    pos[i] = [pl.position.x, pl.position.y, pl.position.z, pl.radius];
+                }
+                pos
+            },
+            point_lights_color: {
+                let mut col = [[0.0f32; 4]; 8];
+                let count = point_lights.len().min(8);
+                for i in 0..count {
+                    let pl = &point_lights[i];
+                    col[i] = [pl.color[0], pl.color[1], pl.color[2], pl.intensity];
+                }
+                col
+            },
+            point_light_count: [point_lights.len().min(8) as u32, 0, 0, 0],
         };
         self.queue
             .write_buffer(&self.scene_buffer, 0, bytemuck::bytes_of(&uniform));

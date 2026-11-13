@@ -86,6 +86,7 @@ pub const RAW_BLOCK_TEXTURES: &[(&str, &[u8])] = &[
     ("shrub", include_bytes!("../../../assets/textures/blocks/shrub.png")),
     ("plant_fiber", include_bytes!("../../../assets/textures/blocks/plant_fiber.png")),
     ("stick", include_bytes!("../../../assets/textures/blocks/stick.png")),
+    ("torch", include_bytes!("../../../assets/textures/blocks/torch.png")),
 ];
 
 pub fn load_texture_array_data() -> (Vec<u8>, u32) {

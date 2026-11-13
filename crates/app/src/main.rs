@@ -11,7 +11,8 @@ use std::time::Instant;
 use engine_core::{
     AvatarModel, BlockId, BlockRegistry, CommandHost, CommandRegistry, EnvironmentProvider,
     GameMode, Inventory, ItemStack, MaterialRegistry, MovementConfig,
-    PlayerMode, ReferenceFrameId, RelativeTransform, ServerHostProfile, WorldGenerator,
+    PlayerMode, PointLight, ReferenceFrameId, RelativeTransform, ServerHostProfile, ShadingModel,
+    WorldGenerator,
 };
 use engine_net::{
     ClientEvent, DiscoveryBeacon, DiscoveryScanner, GameClient, HostEvent,
@@ -543,7 +544,16 @@ impl EngineApp {
         let egui_ctx = egui::Context::default();
         setup_cyrillic_font(&egui_ctx);
 
-        let inventory = Inventory::new();
+        let mut inventory = Inventory::new();
+        if let Some(id) = registry.find("survival:torch") {
+            inventory.slots[0] = Some(ItemStack::new(id, 32));
+        }
+        if let Some(id) = registry.find("survival:wood") {
+            inventory.slots[1] = Some(ItemStack::new(id, 32));
+        }
+        if let Some(id) = registry.find("survival:dirt") {
+            inventory.slots[2] = Some(ItemStack::new(id, 64));
+        }
 
         let mut commands = CommandRegistry::new();
         register_built_in_commands(&mut commands);
@@ -1405,9 +1415,7 @@ impl EngineApp {
 
         let horiz_speed = Vec3::new(self.velocity.x, 0.0, self.velocity.z).length();
         if horiz_speed > 0.15 && (self.on_ground || self.fly_mode || self.controller.in_water) {
-            self.walk_phase += horiz_speed * dt * 5.2;
-        } else {
-            self.walk_phase *= (1.0 - 10.0 * dt).max(0.0);
+            self.walk_phase = (self.walk_phase + horiz_speed * dt * 4.6) % (std::f32::consts::PI * 4.0);
         }
 
         if self.arm_swing_active {
@@ -5203,12 +5211,127 @@ impl ApplicationHandler for EngineApp {
 
                 let env_state = self.environment.evaluate(self.time_of_day);
                 let fog_dist = (self.settings.render_distance as f32) * (CHUNK_SIZE_I32 as f32) * env_state.fog_density;
+
+                // Dynamic Point Lights (Held items + placed torches/glowstones/ores)
+                let mut point_lights: Vec<PointLight> = Vec::with_capacity(8);
+
+                // 1. Light from held item in player hand
+                if let Some(held_item) = self.inventory.selected_item() {
+                    if let Some(def) = self.registry.get(held_item.block_id) {
+                        let is_torch = def.name.contains("torch");
+                        let is_redstone = def.name.contains("redstone");
+                        let is_glowstone = def.name.contains("glowstone");
+                        let is_lantern = def.name.contains("lantern");
+                        let is_magma = def.name.contains("magma");
+
+                        if is_torch || is_redstone || is_glowstone || is_lantern || is_magma || def.shading_model == ShadingModel::Emissive {
+                            let (col, rad, intens) = if is_torch {
+                                ([1.0f32, 0.72, 0.30], 16.0, 1.9)
+                            } else if is_redstone {
+                                ([1.0f32, 0.18, 0.10], 10.0, 1.4)
+                            } else if is_glowstone {
+                                ([1.0f32, 0.90, 0.45], 18.0, 2.0)
+                            } else if is_lantern {
+                                ([1.0f32, 0.80, 0.40], 16.0, 1.8)
+                            } else if is_magma {
+                                ([1.0f32, 0.40, 0.15], 11.0, 1.3)
+                            } else {
+                                (def.emission, 12.0, 1.5)
+                            };
+
+                            let cam_fwd = self.camera.forward();
+                            let cam_right = cam_fwd.cross(Vec3::Y).normalize();
+                            let cam_up = cam_right.cross(cam_fwd).normalize();
+                            let hand_pos = self.camera.position
+                                + cam_fwd * 0.40
+                                + cam_right * 0.28
+                                - cam_up * 0.18;
+                            point_lights.push(PointLight {
+                                position: hand_pos,
+                                color: col,
+                                radius: rad,
+                                intensity: intens,
+                            });
+                        }
+                    }
+                }
+
+                // 2. Dynamic light from placed blocks around the player
+                for (pos_arr, raw_id) in self.world.get_all_raw_edits() {
+                    let b_pos = Vec3::new(pos_arr[0] as f32 + 0.5, pos_arr[1] as f32 + 0.6, pos_arr[2] as f32 + 0.5);
+                    if (b_pos - self.camera.position).length() > 24.0 {
+                        continue;
+                    }
+                    let block_id = BlockId(raw_id);
+                    if let Some(def) = self.registry.get(block_id) {
+                        if def.shading_model == ShadingModel::Emissive {
+                            let is_torch = def.name.contains("torch");
+                            let is_redstone = def.name.contains("redstone");
+                            let (col, rad, intens) = if is_torch {
+                                ([1.0f32, 0.72, 0.30], 15.0, 1.8)
+                            } else if is_redstone {
+                                ([1.0f32, 0.18, 0.10], 9.0, 1.3)
+                            } else {
+                                (def.emission, 14.0, 1.6)
+                            };
+                            point_lights.push(PointLight {
+                                position: b_pos,
+                                color: col,
+                                radius: rad,
+                                intensity: intens,
+                            });
+                            if point_lights.len() >= 8 {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // 3. Scan nearby generated blocks around the player for natural light sources
+                if point_lights.len() < 8 {
+                    let cam_i = self.camera.position.floor().as_ivec3();
+                    'near_scan: for dy in -3..=4 {
+                        for dz in -6..=6 {
+                            for dx in -6..=6 {
+                                if point_lights.len() >= 8 {
+                                    break 'near_scan;
+                                }
+                                let pos = IVec3::new(cam_i.x + dx, cam_i.y + dy, cam_i.z + dz);
+                                let b_id = self.world.get_block(pos);
+                                if b_id == BlockId::AIR {
+                                    continue;
+                                }
+                                if let Some(def) = self.registry.get(b_id) {
+                                    if def.shading_model == ShadingModel::Emissive {
+                                        let b_pos = Vec3::new(pos.x as f32 + 0.5, pos.y as f32 + 0.5, pos.z as f32 + 0.5);
+                                        if !point_lights.iter().any(|l| (l.position - b_pos).length_squared() < 0.25) {
+                                            let is_redstone = def.name.contains("redstone");
+                                            let (col, rad, intens) = if is_redstone {
+                                                ([1.0f32, 0.18, 0.10], 9.0, 1.3)
+                                            } else {
+                                                (def.emission, 12.0, 1.4)
+                                            };
+                                            point_lights.push(PointLight {
+                                                position: b_pos,
+                                                color: col,
+                                                radius: rad,
+                                                intensity: intens,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if let Some(renderer) = &mut self.renderer {
                     match renderer.render(
                         &render_cam,
                         fog_dist,
                         self.settings.brightness,
                         &env_state,
+                        &point_lights,
                         avatar_verts.as_deref(),
                         targeted_block,
                         full_output.pixels_per_point,

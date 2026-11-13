@@ -9,6 +9,9 @@ struct SceneUniform {
     ambient_sky: vec4<f32>,
     ambient_ground: vec4<f32>,
     sky_zenith: vec4<f32>,
+    point_lights_pos: array<vec4<f32>, 8>,
+    point_lights_color: array<vec4<f32>, 8>,
+    point_light_count: vec4<u32>,
 };
 
 @group(0) @binding(0)
@@ -67,9 +70,8 @@ fn calculate_shadow(world_pos: vec3<f32>, normal: vec3<f32>) -> f32 {
     let light_clip = scene.light_view_proj * vec4<f32>(bias_pos, 1.0);
     let shadow_ndc = light_clip.xyz / light_clip.w;
 
-    if (shadow_ndc.x < -1.0 || shadow_ndc.x > 1.0 ||
-        shadow_ndc.y < -1.0 || shadow_ndc.y > 1.0 ||
-        shadow_ndc.z < 0.0 || shadow_ndc.z > 1.0) {
+    let edge_dist = max(abs(shadow_ndc.x), abs(shadow_ndc.y));
+    if (edge_dist >= 1.0 || shadow_ndc.z < 0.0 || shadow_ndc.z > 1.0) {
         return 1.0;
     }
 
@@ -92,7 +94,11 @@ fn calculate_shadow(world_pos: vec3<f32>, normal: vec3<f32>) -> f32 {
         let sample_uv = shadow_uv + offsets[i] * texel_size * 1.5;
         shadow += textureSampleCompare(t_shadow, s_shadow, sample_uv, current_depth);
     }
-    return shadow * 0.25;
+    let pcf_shadow = shadow * 0.25;
+
+    // Smoothly dissolve shadow near the boundary of the cascade frustum
+    let edge_fade = smoothstep(0.72, 0.96, edge_dist);
+    return mix(pcf_shadow, 1.0, edge_fade);
 }
 
 struct VertexInput {
@@ -275,6 +281,26 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         lit_color = (ambient_term + direct) * ao_val;
     }
 
+    // Dynamic point lights (held torches, glowing ores, placed light sources)
+    let active_lights = min(scene.point_light_count.x, 8u);
+    for (var i = 0u; i < active_lights; i = i + 1u) {
+        let l_pos = scene.point_lights_pos[i].xyz;
+        let l_radius = scene.point_lights_pos[i].w;
+        let l_col = scene.point_lights_color[i].rgb;
+        let l_intensity = scene.point_lights_color[i].w;
+
+        let to_light = l_pos - in.world_pos;
+        let d = length(to_light);
+        if (d < l_radius && d > 0.001) {
+            let l_dir = to_light / d;
+            let atten = clamp(1.0 - d / l_radius, 0.0, 1.0);
+            let smooth_atten = atten * atten * (atten * 0.5 + 0.5);
+            let n_dot_l = max(dot(N, l_dir), 0.0);
+            let light_diffuse = albedo * l_col * (n_dot_l * 0.82 + 0.18) * (l_intensity * smooth_atten);
+            lit_color += light_diffuse;
+        }
+    }
+
     // Distance fog: crystal clear near-field, gentle smooth horizon fade
     let dist = distance(in.world_pos, scene.camera_pos.xyz);
     let fog_max = max(scene.camera_pos.w, 32.0);
@@ -432,11 +458,11 @@ fn fs_sky(in: SkyVertexOutput) -> @location(0) vec4<f32> {
         let h1 = fract(sin(dot(uv1, vec2<f32>(12.9898, 78.233))) * 43758.5453);
         let h2 = fract(sin(dot(uv1 + vec2<f32>(0.13, 0.37), vec2<f32>(93.185, 49.321))) * 23421.631);
 
-        if (h1 > 0.9955) {
+        if (h1 > 0.9969) {
             let blue_star = vec3<f32>(0.72, 0.85, 1.0);
             let warm_star = vec3<f32>(1.0, 0.82, 0.65);
             let star_col = mix(blue_star, warm_star, h2);
-            let star_bright = (h1 - 0.9955) / 0.0045 * 2.2;
+            let star_bright = (h1 - 0.9969) / 0.0031 * 2.2;
             let twinkle = sin(time * 2.5 + h1 * 30.0) * 0.15 + 0.85;
             stars = star_col * star_bright * twinkle * night_fade * smoothstep(0.04, 0.20, V.y);
         }

@@ -808,10 +808,10 @@ pub fn build_first_person_arm_mesh(
     // Base camera orientation
     let base_cam_rot = Mat3::from_cols(cam_right, cam_up, -cam_fwd);
 
-    // Walking bobbing
-    let bob_amp = if is_moving { 1.0 } else { 0.12 };
-    let bob_x = (walk_phase * 0.5).sin() * 0.010 * bob_amp;
-    let bob_y = (walk_phase).sin().abs() * 0.008 * bob_amp;
+    // Walking bobbing (smooth sinusoidal sway without sharp .abs() cusps)
+    let bob_amp = if is_moving { 1.0 } else { 0.10 };
+    let bob_x = (walk_phase * 0.5).sin() * 0.007 * bob_amp;
+    let bob_y = (1.0 - (walk_phase * 2.0).cos()) * 0.0035 * bob_amp;
 
     // Shoulder anchor pinned to bottom-right of viewport with weapon sway offset
     let shoulder_pos = camera_pos

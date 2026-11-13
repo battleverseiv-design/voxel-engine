@@ -4,7 +4,8 @@ pub mod lithosphere;
 pub use lithosphere::LithosphereWorldGen;
 
 use engine_core::{
-    BlockDef, BlockGeometry, BlockId, BlockRegistry, BlockTransparency, GameMode, ShadingModel, WorldGenerator,
+    BlockDef, BlockGeometry, BlockId, BlockRegistry, BlockTransparency, GameMode, MaterialDef,
+    MaterialRegistry, ShadingModel, WorldGenerator,
 };
 use glam::{IVec3, Vec3};
 
@@ -27,12 +28,36 @@ impl GameMode for SurvivalMode {
         "survival"
     }
 
+    fn register_materials(&self, materials: &mut MaterialRegistry) {
+        let grass_tint = [0.46, 0.78, 0.32];
+        materials.register(
+            MaterialDef::foliage("survival:foliage_grass", 81, grass_tint)
+                .with_roughness(0.88)
+                .with_subsurface(0.70),
+        );
+        materials.register(
+            MaterialDef::foliage("survival:foliage_shrub", 82, grass_tint)
+                .with_roughness(0.88)
+                .with_subsurface(0.70),
+        );
+        materials.register(
+            MaterialDef::new("survival:ground_grass")
+                .with_color(grass_tint)
+                .with_roughness(0.88),
+        );
+        materials.register(
+            MaterialDef::new("survival:ground_dirt")
+                .with_roughness(0.95),
+        );
+    }
+
     fn register_blocks(&self, registry: &mut BlockRegistry) {
         let white = [1.0, 1.0, 1.0];
+        let grass_tint = [0.46, 0.78, 0.32];
 
         // 1. Grass block
         registry.register(
-            BlockDef::solid_tinted("survival:grass", [0.46, 0.78, 0.32], white, [0.46, 0.78, 0.32])
+            BlockDef::solid_tinted("survival:grass", grass_tint, white, white)
                 .with_face_textures(1, 2, 3)
                 .with_hardness(0.6)
                 .with_roughness(0.92)
@@ -718,14 +743,16 @@ impl GameMode for SurvivalMode {
         // 74. Tall Grass (Wild prairie grass, drops plant fibers)
         let mut grass_def = BlockDef::solid_tinted(
             "survival:tall_grass",
-            white,
-            white,
-            white,
+            grass_tint,
+            grass_tint,
+            grass_tint,
         )
         .with_texture(81)
         .with_geometry(BlockGeometry::Cross)
         .with_transparency(BlockTransparency::Cutout)
         .with_shading(ShadingModel::Foliage)
+        .with_subsurface(0.70)
+        .with_roughness(0.88)
         .with_health(35.0)
         .with_hardness(0.1)
         .with_icon_color([110, 185, 65]);
@@ -733,20 +760,22 @@ impl GameMode for SurvivalMode {
         grass_def.opaque = false;
         registry.register(grass_def);
 
-        // 75. Shrub / Bush (Dry wild bush, drops sticks & fibers)
+        // 75. Shrub / Bush (Lush wild foliage bush, drops sticks & fibers)
         let mut shrub_def = BlockDef::solid_tinted(
             "survival:shrub",
-            white,
-            white,
-            white,
+            grass_tint,
+            grass_tint,
+            grass_tint,
         )
         .with_texture(82)
         .with_geometry(BlockGeometry::Cross)
         .with_transparency(BlockTransparency::Cutout)
         .with_shading(ShadingModel::Foliage)
+        .with_subsurface(0.70)
+        .with_roughness(0.88)
         .with_health(45.0)
         .with_hardness(0.2)
-        .with_icon_color([130, 140, 80]);
+        .with_icon_color([110, 185, 65]);
         shrub_def.solid = false;
         shrub_def.opaque = false;
         registry.register(shrub_def);
@@ -766,6 +795,25 @@ impl GameMode for SurvivalMode {
                 .with_health(25.0)
                 .with_icon_color([140, 100, 60]),
         );
+
+        // 78. Torch (Emissive dynamic light source, crafted from sticks and fibers/coal)
+        let mut torch_def = BlockDef::solid_tinted(
+            "survival:torch",
+            white,
+            white,
+            white,
+        )
+        .with_texture(85)
+        .with_geometry(BlockGeometry::Cross)
+        .with_transparency(BlockTransparency::Cutout)
+        .with_shading(ShadingModel::Emissive)
+        .with_emission([1.0, 0.75, 0.35])
+        .with_health(15.0)
+        .with_hardness(0.0)
+        .with_icon_color([255, 185, 50]);
+        torch_def.solid = false;
+        torch_def.opaque = false;
+        registry.register(torch_def);
     }
 
     fn create_generator(&self, registry: &BlockRegistry) -> Arc<dyn WorldGenerator> {

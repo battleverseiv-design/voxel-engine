@@ -6,7 +6,156 @@ pub use materials::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use glam::{IVec3, Vec3};
+use glam::{IVec3, Quat, Vec3};
+
+/// Unique identifier for a coordinate reference frame (e.g. planetary body, rotating ship, space station).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct ReferenceFrameId(pub u64);
+
+impl ReferenceFrameId {
+    /// The universal global inertial origin.
+    pub const UNIVERSE_ROOT: Self = Self(0);
+}
+
+/// Global sector grid cell size in meters (256.0m).
+pub const SECTOR_SIZE: f32 = 256.0;
+
+/// Hierarchical position and orientation representation for massive/infinite worlds and moving reference frames.
+/// Sector grid spacing is 256.0 meters, preserving single-precision `f32` floating point accuracy indefinitely.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RelativeTransform {
+    pub parent_frame: ReferenceFrameId,
+    pub sector: IVec3,
+    pub local_offset: Vec3,
+    pub local_rotation: Quat,
+    pub local_velocity: Vec3,
+}
+
+impl Default for RelativeTransform {
+    fn default() -> Self {
+        Self {
+            parent_frame: ReferenceFrameId::UNIVERSE_ROOT,
+            sector: IVec3::ZERO,
+            local_offset: Vec3::ZERO,
+            local_rotation: Quat::IDENTITY,
+            local_velocity: Vec3::ZERO,
+        }
+    }
+}
+
+impl RelativeTransform {
+    pub fn new(parent_frame: ReferenceFrameId, sector: IVec3, local_offset: Vec3) -> Self {
+        let mut t = Self {
+            parent_frame,
+            sector,
+            local_offset,
+            local_rotation: Quat::IDENTITY,
+            local_velocity: Vec3::ZERO,
+        };
+        t.normalize();
+        t
+    }
+
+    /// Normalizes `local_offset` mathematically so that each axis coordinate lies strictly within `[0.0, SECTOR_SIZE)`,
+    /// adjusting `sector` using euclidean division (`div_euclid` / `rem_euclid`).
+    pub fn normalize(&mut self) {
+        let sx = (self.local_offset.x / SECTOR_SIZE).floor() as i32;
+        let sy = (self.local_offset.y / SECTOR_SIZE).floor() as i32;
+        let sz = (self.local_offset.z / SECTOR_SIZE).floor() as i32;
+
+        self.sector += IVec3::new(sx, sy, sz);
+        self.local_offset.x -= sx as f32 * SECTOR_SIZE;
+        self.local_offset.y -= sy as f32 * SECTOR_SIZE;
+        self.local_offset.z -= sz as f32 * SECTOR_SIZE;
+
+        // Ensure no negative floating point zero or rounding overshoot
+        if self.local_offset.x < 0.0 {
+            self.sector.x -= 1;
+            self.local_offset.x += SECTOR_SIZE;
+        } else if self.local_offset.x >= SECTOR_SIZE {
+            self.sector.x += 1;
+            self.local_offset.x -= SECTOR_SIZE;
+        }
+
+        if self.local_offset.y < 0.0 {
+            self.sector.y -= 1;
+            self.local_offset.y += SECTOR_SIZE;
+        } else if self.local_offset.y >= SECTOR_SIZE {
+            self.sector.y += 1;
+            self.local_offset.y -= SECTOR_SIZE;
+        }
+
+        if self.local_offset.z < 0.0 {
+            self.sector.z -= 1;
+            self.local_offset.z += SECTOR_SIZE;
+        } else if self.local_offset.z >= SECTOR_SIZE {
+            self.sector.z += 1;
+            self.local_offset.z -= SECTOR_SIZE;
+        }
+
+        self.local_rotation = self.local_rotation.normalize();
+    }
+
+    /// Converts this relative transform into continuous relative coordinates relative to a base sector in the same frame.
+    #[inline]
+    pub fn to_continuous(&self, base_sector: IVec3) -> Vec3 {
+        let d_sector = self.sector - base_sector;
+        Vec3::new(
+            d_sector.x as f32 * SECTOR_SIZE + self.local_offset.x,
+            d_sector.y as f32 * SECTOR_SIZE + self.local_offset.y,
+            d_sector.z as f32 * SECTOR_SIZE + self.local_offset.z,
+        )
+    }
+
+    /// Constructs a transform from continuous coordinates relative to a base sector in a frame.
+    pub fn from_continuous(parent_frame: ReferenceFrameId, base_sector: IVec3, offset: Vec3) -> Self {
+        let mut t = Self {
+            parent_frame,
+            sector: base_sector,
+            local_offset: offset,
+            local_rotation: Quat::IDENTITY,
+            local_velocity: Vec3::ZERO,
+        };
+        t.normalize();
+        t
+    }
+
+    /// Seamlessly reparents this transform to a new coordinate reference frame (e.g., when a player
+    /// boards or steps off a moving spaceship onto a planetary body).
+    /// `old_frame_in_new` is the position, orientation, and linear velocity of the old frame relative to `new_frame`.
+    /// `old_frame_angular_velocity` is the angular rotation velocity vector of the old frame in radians per second.
+    pub fn reparent_to(
+        &mut self,
+        new_frame: ReferenceFrameId,
+        old_frame_in_new: &RelativeTransform,
+        old_frame_angular_velocity: Vec3,
+    ) {
+        let local_pos = self.to_continuous(IVec3::ZERO);
+        let rotated_pos = old_frame_in_new.local_rotation * local_pos;
+
+        self.parent_frame = new_frame;
+        self.sector = old_frame_in_new.sector;
+        self.local_offset = old_frame_in_new.local_offset + rotated_pos;
+        self.local_rotation = (old_frame_in_new.local_rotation * self.local_rotation).normalize();
+
+        // v_new = v_frame + R * v_local + omega x r
+        let tangential_velocity = old_frame_angular_velocity.cross(rotated_pos);
+        self.local_velocity = old_frame_in_new.local_velocity
+            + old_frame_in_new.local_rotation * self.local_velocity
+            + tangential_velocity;
+
+        self.normalize();
+    }
+
+    /// Simplified reparenting for non-rotating or static reference frames.
+    pub fn reparent_simple(
+        &mut self,
+        new_frame: ReferenceFrameId,
+        old_frame_in_new: &RelativeTransform,
+    ) {
+        self.reparent_to(new_frame, old_frame_in_new, Vec3::ZERO);
+    }
+}
 
 /// Compact identifier for a voxel block type registered by a game mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -15,6 +164,7 @@ pub struct BlockId(pub u16);
 impl BlockId {
     /// Reserved empty space block always registered at index 0.
     pub const AIR: Self = Self(0);
+    pub const WATER: Self = Self(13);
 }
 
 /// Six axis-aligned faces of a voxel cube.
@@ -415,6 +565,17 @@ impl CommandRegistry {
     }
 }
 
+/// Optimization hint describing the structural density of a chunk volume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeHint {
+    /// The entire chunk consists exclusively of air/empty space.
+    AllEmpty,
+    /// The entire chunk is uniformly packed with a single solid block.
+    AllSolid(BlockId),
+    /// The chunk contains terrain surface, caves, structures, or mixed blocks.
+    MixedSurface,
+}
+
 /// Thread-safe world generator implemented by a game mode.
 pub trait WorldGenerator: Send + Sync {
     /// Fills a `chunk_size^3` slice in `x + z * size + y * size * size` order.
@@ -430,6 +591,58 @@ pub trait WorldGenerator: Send + Sync {
     fn column_max_height(&self, _x: i32, _z: i32) -> i32 {
         i32::MAX
     }
+
+    /// Fast volumetric density hint for a chunk. Allows the streamer to bypass voxel generation
+    /// or meshing for guaranteed uniform or empty chunks without sampling noise.
+    fn query_volume_hint(&self, chunk_pos: IVec3) -> VolumeHint {
+        let (min_y, max_y) = self.vertical_bounds();
+        if chunk_pos.y < min_y || chunk_pos.y > max_y {
+            return VolumeHint::AllEmpty;
+        }
+
+        let wx = chunk_pos.x * 16;
+        let wz = chunk_pos.z * 16;
+        let max_h = self.column_max_height(wx, wz);
+        if chunk_pos.y * 16 > max_h {
+            return VolumeHint::AllEmpty;
+        }
+
+        VolumeHint::MixedSurface
+    }
+}
+
+/// Network synchronization visibility policy for voxel and entity updates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VisibilityPolicy {
+    /// Broadcast all world updates within the player's full chunk render radius (classic Minecraft/survival).
+    #[default]
+    FullRadius,
+    /// Occlusion-culling visibility: blocks and players hidden behind solid walls are not sent (anti-cheat for shooters/CS/DayZ).
+    StrictLineOfSight,
+}
+
+/// Global world simulation and physics rules for a game mode.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SimulationRules {
+    /// Gravitational acceleration vector in m/s^2. Defaults to Earth-like `Vec3::new(0.0, -9.81, 0.0)`.
+    pub gravity: Vec3,
+    /// Physical voxel size in meters. Defaults to 1.0 (1 meter cubes), scalable to 0.5 or 0.25 for micro-voxels.
+    pub voxel_scale: f32,
+    /// Network visibility policy.
+    pub visibility_policy: VisibilityPolicy,
+    /// Structural integrity and collapse calculation flag (stress propagation / gravity collapse).
+    pub structural_integrity: bool,
+}
+
+impl Default for SimulationRules {
+    fn default() -> Self {
+        Self {
+            gravity: Vec3::new(0.0, -9.81, 0.0),
+            voxel_scale: 1.0,
+            visibility_policy: VisibilityPolicy::FullRadius,
+            structural_integrity: false,
+        }
+    }
 }
 
 /// Entry interface for pluggable game modes running on top of the engine.
@@ -443,6 +656,11 @@ pub trait GameMode: Send + Sync {
     fn create_generator(&self, registry: &BlockRegistry) -> Arc<dyn WorldGenerator>;
     fn spawn_position(&self) -> Vec3;
     fn default_place_block(&self, registry: &BlockRegistry) -> BlockId;
+
+    /// Simulation and physics configuration for this game mode. Defaults to standard survival physics.
+    fn simulation_rules(&self) -> SimulationRules {
+        SimulationRules::default()
+    }
 
     /// Pluggable environment and atmospheric provider. Defaults to `StandardEnvironment`.
     fn create_environment(&self) -> Arc<dyn EnvironmentProvider> {
@@ -597,4 +815,85 @@ pub struct PointLight {
     pub color: [f32; 3],
     pub radius: f32,
     pub intensity: f32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_transform_normalization_preserves_position() {
+        let mut transform = RelativeTransform::new(
+            ReferenceFrameId::UNIVERSE_ROOT,
+            IVec3::new(10, -5, 2),
+            Vec3::new(300.0, -50.0, 512.0),
+        );
+        transform.normalize();
+
+        assert!(transform.local_offset.x >= 0.0 && transform.local_offset.x < SECTOR_SIZE);
+        assert!(transform.local_offset.y >= 0.0 && transform.local_offset.y < SECTOR_SIZE);
+        assert!(transform.local_offset.z >= 0.0 && transform.local_offset.z < SECTOR_SIZE);
+
+        let original_total = Vec3::new(
+            10.0 * SECTOR_SIZE + 300.0,
+            -5.0 * SECTOR_SIZE - 50.0,
+            2.0 * SECTOR_SIZE + 512.0,
+        );
+        let normalized_total = Vec3::new(
+            transform.sector.x as f32 * SECTOR_SIZE + transform.local_offset.x,
+            transform.sector.y as f32 * SECTOR_SIZE + transform.local_offset.y,
+            transform.sector.z as f32 * SECTOR_SIZE + transform.local_offset.z,
+        );
+
+        assert!((original_total - normalized_total).length() < 0.001);
+    }
+
+    #[test]
+    fn relative_transform_reparenting_seamless() {
+        let ship_frame = ReferenceFrameId(100);
+        let station_frame = ReferenceFrameId(200);
+
+        // Ship is located at (100, 0, 0) relative to station, moving at 20 m/s in X
+        let ship_in_station = RelativeTransform {
+            parent_frame: station_frame,
+            sector: IVec3::ZERO,
+            local_offset: Vec3::new(100.0, 0.0, 0.0),
+            local_rotation: Quat::IDENTITY,
+            local_velocity: Vec3::new(20.0, 0.0, 0.0),
+        };
+
+        // Player is walking inside the ship at (5, 0, 0) with relative speed 2 m/s
+        let mut player = RelativeTransform {
+            parent_frame: ship_frame,
+            sector: IVec3::ZERO,
+            local_offset: Vec3::new(5.0, 0.0, 0.0),
+            local_rotation: Quat::IDENTITY,
+            local_velocity: Vec3::new(2.0, 0.0, 0.0),
+        };
+
+        player.reparent_to(station_frame, &ship_in_station, Vec3::ZERO);
+
+        assert_eq!(player.parent_frame, station_frame);
+        assert!((player.local_offset.x - 105.0).abs() < 0.001);
+        assert!((player.local_velocity.x - 22.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn grid_container_item_packing_and_rotation() {
+        let mut container = GridContainer::new(10, 10, 50.0);
+
+        let rifle = ItemStack::new(BlockId(1), 1);
+        let idx = container.auto_pack(rifle, (4, 2), 3.5).expect("should fit rifle");
+        assert_eq!(container.items[idx].effective_size(), (4, 2));
+
+        // Rotate rifle
+        assert!(container.rotate_item(idx).is_ok());
+        assert_eq!(container.items[idx].effective_size(), (2, 4));
+
+        // Insert second item next to it
+        let medkit = ItemStack::new(BlockId(2), 1);
+        assert!(container.auto_pack(medkit, (2, 2), 0.5).is_ok());
+
+        assert!((container.total_weight() - 4.0).abs() < 0.001);
+    }
 }

@@ -1,0 +1,19 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+egui.workspace = true
+egui-winit.workspace = true
+engine-audio = { path = "../engine-audio" }
+engine-core = { path = "../engine-core" }
+engine-net = { path = "../engine-net" }
+engine-render = { path = "../engine-render" }
+engine-world = { path = "../engine-world" }
+game-survival = { path = "../game-survival" }
+glam.workspace = true
+serde.workspace = true
+toml.workspace = true
+winit.workspace = true

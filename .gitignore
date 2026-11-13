@@ -1,0 +1,7 @@
+/target
+/*.exe
+/*.pdb
+/world.dat
+*.png
+.idea/
+.vscode/

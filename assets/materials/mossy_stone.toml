@@ -1,0 +1,9 @@
+name = "survival:mossy_stone"
+shading_model = "StandardPbr"
+alpha_mode = "Opaque"
+texture_id = 4
+roughness = 0.88
+metallic = 0.0
+base_color = [0.82, 0.95, 0.78, 1.0]
+subsurface = 0.0
+emission = [0.0, 0.0, 0.0]

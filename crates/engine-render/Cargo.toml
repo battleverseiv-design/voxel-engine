@@ -1,0 +1,17 @@
+[package]
+name = "engine-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+engine-core = { path = "../engine-core" }
+engine-world = { path = "../engine-world" }
+glam.workspace = true
+image.workspace = true
+pollster.workspace = true
+wgpu.workspace = true
+winit.workspace = true

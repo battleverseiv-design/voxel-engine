@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/engine-core",
+    "crates/engine-world",
+    "crates/engine-render",
+    "crates/engine-net",
+    "crates/engine-audio",
+    "crates/game-survival",
+    "crates/app",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+bytemuck = { version = "1.21", features = ["derive"] }
+egui = "0.31"
+egui-wgpu = "0.31"
+egui-winit = "0.31"
+glam = "0.29"
+image = { version = "0.25", default-features = false, features = ["png"] }
+pollster = "0.4"
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+wgpu = "24"
+winit = "0.30"

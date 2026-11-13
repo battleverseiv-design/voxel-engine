@@ -1,0 +1,21 @@
+mouse_sensitivity = 1.0
+mouse_smoothing = 0.15000000596046448
+invert_y = false
+fov_degrees = 110.0
+render_distance = 13
+brightness = 1.3200000524520874
+vsync = false
+fly_speed = 40.0
+show_hud = true
+
+[keybinds]
+forward = "W"
+backward = "S"
+left = "A"
+right = "D"
+jump_up = "Space"
+down = "LCtrl"
+sprint = "LShift"
+toggle_fly = "F"
+chat = "T"
+command = "/"

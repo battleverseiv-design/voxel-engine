@@ -1757,6 +1757,8 @@ impl EngineApp {
                         self.apply_and_broadcast_block(hit.place_pos, place_id);
                         audio::play_event_at("block.place", hit.place_pos.as_vec3());
                         modified = true;
+                        self.arm_swing_active = true;
+                        self.arm_swing_progress = 0.15;
                     }
                 }
             }
@@ -4628,6 +4630,7 @@ impl ApplicationHandler for EngineApp {
                             self.controller.is_crouching,
                             !self.controller.on_ground && !self.controller.in_water,
                             self.controller.in_water,
+                            self.arm_swing_progress,
                             held_colors,
                         );
                         all_avatar_verts.extend(verts);
@@ -4687,6 +4690,7 @@ impl ApplicationHandler for EngineApp {
                         false,
                         false,
                         false,
+                        if is_dead { 0.0 } else { remote.arm_swing },
                         if is_dead { None } else { held_colors },
                     );
                     if remote.hurt_timer > 0.0 || is_dead {

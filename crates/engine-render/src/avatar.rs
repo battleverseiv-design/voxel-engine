@@ -135,6 +135,7 @@ pub fn build_avatar_mesh(
     is_crouching: bool,
     is_in_air: bool,
     is_swimming: bool,
+    arm_swing: f32,
     held_block_colors: Option<[[f32; 3]; 6]>,
 ) -> Vec<VoxelVertex> {
     let mut vertices = Vec::with_capacity(650);
@@ -358,9 +359,17 @@ pub fn build_avatar_mesh(
         0.0
     };
 
+    // Mining / Attacking / Placing action swing dynamics
+    let p = arm_swing.clamp(0.0, 1.0);
+    let s_fast = (p.sqrt() * std::f32::consts::PI).sin();
+    let s_full = (p * std::f32::consts::PI).sin();
+
+    let swing_chest_twist = if p > 0.001 { -s_full * 0.22 } else { 0.0 };
+    let swing_chest_pitch = if p > 0.001 { s_fast * 0.10 } else { 0.0 };
+
     let chest_rot = pelvis_rot
-        * Mat3::from_rotation_y(chest_twist)
-        * Mat3::from_rotation_x(torso_tilt);
+        * Mat3::from_rotation_y(chest_twist + swing_chest_twist)
+        * Mat3::from_rotation_x(torso_tilt + swing_chest_pitch);
 
     let chest_center = pelvis_center + chest_rot * Vec3::new(0.0, 0.26, 0.0);
     push_box(
@@ -533,13 +542,18 @@ pub fn build_avatar_mesh(
     // Right Arm
     let r_shoulder = chest_center + chest_rot * Vec3::new(0.25, shoulder_y, 0.0);
     let r_air_roll = if is_in_air { -0.28 } else { -0.06 };
-    let r_up_angle = if held_block_colors.is_some() {
+    let r_up_angle = if p > 0.001 {
+        // Mining / placing chop curve: lifts arm on windup, slams down forward on strike
+        let chop = -0.55 * (1.0 - p).powi(2) + 0.95 * s_fast;
+        chop - arm_swing_r * 0.15
+    } else if held_block_colors.is_some() {
         0.52 - arm_swing_r * 0.25
     } else {
         arm_swing_r
     };
+    let r_swing_roll = if p > 0.001 { -s_fast * 0.22 } else { 0.0 };
     let r_up_rot = chest_rot
-        * Mat3::from_rotation_z(r_air_roll)
+        * Mat3::from_rotation_z(r_air_roll + r_swing_roll)
         * Mat3::from_rotation_x(r_up_angle);
     let r_up_center = r_shoulder + r_up_rot * Vec3::new(0.0, -upper_len * 0.5, 0.0);
     // Upper Arm Sleeve
@@ -561,7 +575,12 @@ pub fn build_avatar_mesh(
 
     // Elbow & Forearm
     let r_elbow_pos = r_shoulder + r_up_rot * Vec3::new(0.0, -upper_len, 0.0);
-    let r_fore_rot = r_up_rot * Mat3::from_rotation_x(elbow_bend_r);
+    let r_elbow_bend = if p > 0.001 {
+        0.30 + s_full * 0.90
+    } else {
+        elbow_bend_r
+    };
+    let r_fore_rot = r_up_rot * Mat3::from_rotation_x(r_elbow_bend);
     let r_fore_center = r_elbow_pos + r_fore_rot * Vec3::new(0.0, -fore_len * 0.5, 0.0);
     push_box(
         &mut vertices,

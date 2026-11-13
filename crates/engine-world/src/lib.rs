@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -7,16 +7,21 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use bytemuck::{Pod, Zeroable};
-use engine_core::{BlockFace, BlockId, BlockRegistry, BlockTransparency, ShadingModel, WorldGenerator};
+use engine_core::{
+    BlockFace, BlockId, BlockRegistry, MaterialRegistry,
+    ReferenceFrameId, RelativeTransform, ShadingModel, WorldGenerator,
+};
 use glam::{IVec3, Vec3};
 use rayon::prelude::*;
 
 pub const CHUNK_SIZE: usize = 16;
 pub const CHUNK_SIZE_I32: i32 = CHUNK_SIZE as i32;
 pub const CHUNK_VOLUME: usize = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE; // 4096
+pub const INFINITE_PERIOD: i64 = 1_048_576; // 2^20 blocks period for floating point safety
 const WORLD_MAGIC: &[u8; 4] = b"VXW1";
 const AO_CURVE: [f32; 4] = [1.0, 0.82, 0.66, 0.48];
 
+/// Status state machine for chunk streaming lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ChunkStatus {
     Empty = 0,
@@ -46,6 +51,12 @@ pub fn world_to_chunk(pos: IVec3) -> (IVec3, [usize; 3]) {
     (chunk, local)
 }
 
+/// Converts a chunk coordinate and local voxel offset back to world coordinate.
+#[inline]
+pub fn chunk_to_world(chunk_pos: IVec3, local: [usize; 3]) -> IVec3 {
+    chunk_pos * CHUNK_SIZE_I32 + IVec3::new(local[0] as i32, local[1] as i32, local[2] as i32)
+}
+
 #[inline]
 pub fn pack_delta_index(x: usize, y: usize, z: usize) -> u16 {
     (((x as u16) & 0x0F) << 8) | (((y as u16) & 0x0F) << 4) | ((z as u16) & 0x0F)
@@ -58,6 +69,111 @@ pub fn unpack_delta_index(packed: u16) -> (usize, usize, usize) {
         ((packed >> 4) & 0x0F) as usize,
         (packed & 0x0F) as usize,
     )
+}
+
+/// High-quality 64-bit spatial hash function (SplitMix64 / Murmur3 mix)
+/// ensuring deterministic noise seeding across infinite worlds.
+#[inline]
+pub fn spatial_hash_i64(x: i64, y: i64, z: i64, seed: u64) -> u64 {
+    let mut h = seed
+        .wrapping_add((x as u64).wrapping_mul(0x9E3779B97F4A7C15))
+        .wrapping_add((y as u64).wrapping_mul(0xBF58476D1CE4E5B9))
+        .wrapping_add((z as u64).wrapping_mul(0x94D049BB133111EB));
+    h = (h ^ (h >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94D049BB133111EB);
+    h ^ (h >> 31)
+}
+
+/// Folds 64-bit infinite coordinates into `(super_sector, local_offset)` with a period of `1_048_576` blocks.
+/// Prevents single-precision `f32` floating point jitter and mantissa degradation at extreme distances (Far Lands protection).
+#[inline]
+pub fn sample_infinite_coord(coord: i64) -> (i32, i32) {
+    let super_sector = coord.div_euclid(INFINITE_PERIOD) as i32;
+    let local = coord.rem_euclid(INFINITE_PERIOD) as i32;
+    (super_sector, local)
+}
+
+/// Structure template stamped deterministically across chunk boundaries.
+#[derive(Debug, Clone)]
+pub struct PlacedStructure {
+    pub origin: IVec3,
+    pub bounds_min: IVec3,
+    pub bounds_max: IVec3,
+    pub voxels: Vec<(IVec3, BlockId)>,
+}
+
+/// Generator trait for macro-grid structures (dungeons, trees, asteroids, bunkers).
+pub trait StructureGenerator: Send + Sync {
+    fn evaluate_cell(&self, cell: IVec3, seed: u64) -> Option<PlacedStructure>;
+}
+
+/// Macro-cell structure spawner that stamps multi-chunk structures seamlessly
+/// across neighboring macro-cells without seam clipping.
+pub struct StructureGridSpawner {
+    pub macro_cell_size: i32,
+    pub seed: u64,
+}
+
+impl StructureGridSpawner {
+    pub fn new(macro_cell_size: i32, seed: u64) -> Self {
+        Self {
+            macro_cell_size: macro_cell_size.max(16),
+            seed,
+        }
+    }
+
+    /// Stamps all overlapping structures from neighboring macro-cells into `chunk`.
+    pub fn stamp_chunk(
+        &self,
+        chunk_pos: IVec3,
+        chunk: &mut Chunk,
+        generator: &dyn StructureGenerator,
+    ) {
+        let chunk_min = chunk_pos * CHUNK_SIZE_I32;
+        let chunk_max = chunk_min + IVec3::splat(CHUNK_SIZE_I32 - 1);
+
+        let cell_min_x = (chunk_min.x - self.macro_cell_size).div_euclid(self.macro_cell_size);
+        let cell_max_x = (chunk_max.x + self.macro_cell_size).div_euclid(self.macro_cell_size);
+        let cell_min_y = (chunk_min.y - self.macro_cell_size).div_euclid(self.macro_cell_size);
+        let cell_max_y = (chunk_max.y + self.macro_cell_size).div_euclid(self.macro_cell_size);
+        let cell_min_z = (chunk_min.z - self.macro_cell_size).div_euclid(self.macro_cell_size);
+        let cell_max_z = (chunk_max.z + self.macro_cell_size).div_euclid(self.macro_cell_size);
+
+        for cy in cell_min_y..=cell_max_y {
+            for cz in cell_min_z..=cell_max_z {
+                for cx in cell_min_x..=cell_max_x {
+                    let cell = IVec3::new(cx, cy, cz);
+                    let cell_seed = spatial_hash_i64(cx as i64, cy as i64, cz as i64, self.seed);
+                    if let Some(structure) = generator.evaluate_cell(cell, cell_seed) {
+                        let intersects = structure.bounds_min.x <= chunk_max.x
+                            && structure.bounds_max.x >= chunk_min.x
+                            && structure.bounds_min.y <= chunk_max.y
+                            && structure.bounds_max.y >= chunk_min.y
+                            && structure.bounds_min.z <= chunk_max.z
+                            && structure.bounds_max.z >= chunk_min.z;
+
+                        if intersects {
+                            for &(voxel_offset, block_id) in &structure.voxels {
+                                let world_pos = structure.origin + voxel_offset;
+                                if world_pos.x >= chunk_min.x
+                                    && world_pos.x <= chunk_max.x
+                                    && world_pos.y >= chunk_min.y
+                                    && world_pos.y <= chunk_max.y
+                                    && world_pos.z >= chunk_min.z
+                                    && world_pos.z <= chunk_max.z
+                                {
+                                    let lx = (world_pos.x - chunk_min.x) as usize;
+                                    let ly = (world_pos.y - chunk_min.y) as usize;
+                                    let lz = (world_pos.z - chunk_min.z) as usize;
+                                    chunk.set(lx, ly, lz, block_id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Compact per-chunk delta storage replacing nested HashMaps.
@@ -95,6 +211,69 @@ impl ChunkDelta {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.edits.is_empty()
+    }
+}
+
+/// LRU delta pager managing player world edits. Pure procedural chunks are dropped immediately
+/// without disk writes, while modified chunks are cached in RAM and flushed to disk when memory limit is exceeded.
+#[derive(Debug, Clone)]
+pub struct InfiniteDeltaPager {
+    max_memory_chunks: usize,
+    cache: HashMap<IVec3, ChunkDelta>,
+    lru_order: VecDeque<IVec3>,
+    disk_storage: HashMap<IVec3, ChunkDelta>,
+}
+
+impl Default for InfiniteDeltaPager {
+    fn default() -> Self {
+        Self::new(512)
+    }
+}
+
+impl InfiniteDeltaPager {
+    pub fn new(max_memory_chunks: usize) -> Self {
+        Self {
+            max_memory_chunks: max_memory_chunks.max(1),
+            cache: HashMap::new(),
+            lru_order: VecDeque::new(),
+            disk_storage: HashMap::new(),
+        }
+    }
+
+    pub fn page_out(&mut self, pos: IVec3, delta: ChunkDelta) {
+        if delta.is_empty() {
+            return;
+        }
+        self.lru_order.retain(|&p| p != pos);
+        self.lru_order.push_back(pos);
+        self.cache.insert(pos, delta);
+
+        while self.cache.len() > self.max_memory_chunks {
+            if let Some(oldest) = self.lru_order.pop_front() {
+                if let Some(evicted) = self.cache.remove(&oldest) {
+                    self.disk_storage.insert(oldest, evicted);
+                }
+            }
+        }
+    }
+
+    pub fn page_in(&mut self, pos: IVec3) -> Option<ChunkDelta> {
+        if let Some(delta) = self.cache.remove(&pos) {
+            self.lru_order.retain(|&p| p != pos);
+            return Some(delta);
+        }
+        if let Some(delta) = self.disk_storage.remove(&pos) {
+            return Some(delta);
+        }
+        None
+    }
+
+    pub fn peek(&self, pos: &IVec3) -> Option<&ChunkDelta> {
+        self.cache.get(pos).or_else(|| self.disk_storage.get(pos))
+    }
+
+    pub fn total_saved_count(&self) -> usize {
+        self.cache.len() + self.disk_storage.len()
     }
 }
 
@@ -162,6 +341,20 @@ pub struct VoxelVertex {
 pub struct ChunkMesh {
     pub vertices: Vec<VoxelVertex>,
     pub indices: Vec<u32>,
+}
+
+impl ChunkMesh {
+    pub fn empty() -> Self {
+        Self {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -253,6 +446,339 @@ impl Drop for WorldStreamer {
     }
 }
 
+/// A cluster of detached blocks produced by structural collapse.
+#[derive(Debug, Clone)]
+pub struct DetachedVoxelCluster {
+    pub origin_world: IVec3,
+    pub pivot: Vec3,
+    pub bounds_min: IVec3,
+    pub bounds_max: IVec3,
+    pub blocks: Vec<(IVec3, BlockId)>,
+}
+
+/// Structural integrity service that detects collapses and floating voxel clusters.
+pub struct StructuralIntegrityChecker;
+
+impl StructuralIntegrityChecker {
+    pub const DEFAULT_MAX_BFS_BLOCKS: usize = 2048;
+
+    /// Checks if destroying `broken_pos` causes adjacent solid blocks to lose connection to ground/bedrock.
+    /// Detached blocks are removed from `world`, marked Dirty, and returned as physics clusters.
+    pub fn check_and_detach(
+        world: &mut World,
+        broken_pos: IVec3,
+        registry: &BlockRegistry,
+        materials: &MaterialRegistry,
+        ground_anchor_y: i32,
+    ) -> Vec<DetachedVoxelCluster> {
+        let neighbors = [
+            broken_pos + IVec3::new(1, 0, 0),
+            broken_pos + IVec3::new(-1, 0, 0),
+            broken_pos + IVec3::new(0, 1, 0),
+            broken_pos + IVec3::new(0, -1, 0),
+            broken_pos + IVec3::new(0, 0, 1),
+            broken_pos + IVec3::new(0, 0, -1),
+        ];
+
+        let mut detached_clusters = Vec::new();
+        let mut global_visited = HashSet::new();
+        global_visited.insert(broken_pos);
+
+        for start_pos in neighbors {
+            let start_block = world.get_block(start_pos);
+            if start_block == BlockId::AIR || start_block == BlockId::WATER || global_visited.contains(&start_pos) {
+                continue;
+            }
+
+            let mut queue = VecDeque::new();
+            let mut cluster_blocks = Vec::new();
+            let mut local_visited = HashSet::new();
+            let mut is_anchored = false;
+
+            queue.push_back((start_pos, 0u16));
+            local_visited.insert(start_pos);
+
+            while let Some((current, load_accum)) = queue.pop_front() {
+                cluster_blocks.push(current);
+
+                if current.y <= ground_anchor_y {
+                    is_anchored = true;
+                    break;
+                }
+
+                let block_id = world.get_block(current);
+                if let Some(def) = registry.get(block_id) {
+                    if def.hardness > 50.0 {
+                        is_anchored = true;
+                        break;
+                    }
+                }
+
+                if cluster_blocks.len() >= Self::DEFAULT_MAX_BFS_BLOCKS {
+                    is_anchored = true;
+                    break;
+                }
+
+                let max_load = if let Some(def) = registry.get(block_id) {
+                    materials.get(def.face_materials[0]).map(|m| m.max_structural_load).unwrap_or(100)
+                } else {
+                    100
+                };
+
+                for (dx, dy, dz) in [
+                    (1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1),
+                ] {
+                    let npos = current + IVec3::new(dx, dy, dz);
+                    if local_visited.contains(&npos) || global_visited.contains(&npos) {
+                        continue;
+                    }
+                    let nb = world.get_block(npos);
+                    if nb != BlockId::AIR && nb != BlockId::WATER {
+                        let next_load = load_accum + 10;
+                        if next_load <= max_load {
+                            local_visited.insert(npos);
+                            queue.push_back((npos, next_load));
+                        }
+                    }
+                }
+            }
+
+            if is_anchored {
+                for b in local_visited {
+                    global_visited.insert(b);
+                }
+            } else {
+                let mut min_bound = IVec3::splat(i32::MAX);
+                let mut max_bound = IVec3::splat(i32::MIN);
+                let mut sum_pos = Vec3::ZERO;
+                let origin = cluster_blocks[0];
+
+                let mut detached_voxels = Vec::with_capacity(cluster_blocks.len());
+
+                for &p in &cluster_blocks {
+                    global_visited.insert(p);
+                    let block_id = world.get_block(p);
+                    world.set_block(p, BlockId::AIR);
+
+                    min_bound = min_bound.min(p);
+                    max_bound = max_bound.max(p);
+                    sum_pos += p.as_vec3();
+                    detached_voxels.push((p - origin, block_id));
+                }
+
+                let pivot = sum_pos / (cluster_blocks.len() as f32);
+
+                detached_clusters.push(DetachedVoxelCluster {
+                    origin_world: origin,
+                    pivot,
+                    bounds_min: min_bound,
+                    bounds_max: max_bound,
+                    blocks: detached_voxels,
+                });
+            }
+        }
+
+        detached_clusters
+    }
+}
+
+/// Axis-aligned bounding box collider.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AabbBox {
+    pub min: Vec3,
+    pub max: Vec3,
+}
+
+impl AabbBox {
+    pub fn new(min: Vec3, max: Vec3) -> Self {
+        Self { min, max }
+    }
+
+    pub fn intersects(&self, other: &AabbBox) -> bool {
+        self.min.x <= other.max.x
+            && self.max.x >= other.min.x
+            && self.min.y <= other.max.y
+            && self.max.y >= other.min.y
+            && self.min.z <= other.max.z
+            && self.max.z >= other.min.z
+    }
+}
+
+/// 3D Greedy collision volume generator merging adjacent solid voxels into large AABB boxes.
+pub struct GreedyColliderBoxes;
+
+impl GreedyColliderBoxes {
+    pub fn build_colliders(chunk: &Chunk, origin: IVec3, scale: f32) -> Vec<AabbBox> {
+        let mut colliders = Vec::new();
+        let mut visited = [false; CHUNK_VOLUME];
+
+        for y in 0..CHUNK_SIZE {
+            for z in 0..CHUNK_SIZE {
+                for x in 0..CHUNK_SIZE {
+                    let idx = chunk_index(x, y, z);
+                    if visited[idx] || chunk.get(x, y, z) == BlockId::AIR {
+                        continue;
+                    }
+
+                    let mut w = 1;
+                    while x + w < CHUNK_SIZE {
+                        let next_idx = chunk_index(x + w, y, z);
+                        if visited[next_idx] || chunk.get(x + w, y, z) == BlockId::AIR {
+                            break;
+                        }
+                        w += 1;
+                    }
+
+                    let mut d = 1;
+                    'outer_z: while z + d < CHUNK_SIZE {
+                        for kx in 0..w {
+                            let next_idx = chunk_index(x + kx, y, z + d);
+                            if visited[next_idx] || chunk.get(x + kx, y, z + d) == BlockId::AIR {
+                                break 'outer_z;
+                            }
+                        }
+                        d += 1;
+                    }
+
+                    let mut h = 1;
+                    'outer_y: while y + h < CHUNK_SIZE {
+                        for kz in 0..d {
+                            for kx in 0..w {
+                                let next_idx = chunk_index(x + kx, y + h, z + kz);
+                                if visited[next_idx] || chunk.get(x + kx, y + h, z + kz) == BlockId::AIR {
+                                    break 'outer_y;
+                                }
+                            }
+                        }
+                        h += 1;
+                    }
+
+                    for dy in 0..h {
+                        for dz in 0..d {
+                            for dx in 0..w {
+                                visited[chunk_index(x + dx, y + dy, z + dz)] = true;
+                            }
+                        }
+                    }
+
+                    let min_pos = (origin * CHUNK_SIZE_I32).as_vec3() * scale
+                        + Vec3::new(x as f32, y as f32, z as f32) * scale;
+                    let max_pos = min_pos + Vec3::new(w as f32, h as f32, d as f32) * scale;
+                    colliders.push(AabbBox::new(min_pos, max_pos));
+                }
+            }
+        }
+
+        colliders
+    }
+}
+
+/// A mobile, dynamic voxel structure (moving ship, vehicle, elevator, falling debris cluster)
+/// with its own local coordinate system, meshes, and collision geometry.
+pub struct VoxelContraption {
+    pub id: u64,
+    pub transform: RelativeTransform,
+    pub chunks: HashMap<IVec3, Arc<Chunk>>,
+    pub meshes: HashMap<IVec3, ChunkMesh>,
+    pub colliders: Vec<AabbBox>,
+    pub dirty: bool,
+    pub voxel_scale: f32,
+}
+
+impl VoxelContraption {
+    pub fn new(id: u64, transform: RelativeTransform, voxel_scale: f32) -> Self {
+        Self {
+            id,
+            transform,
+            chunks: HashMap::new(),
+            meshes: HashMap::new(),
+            colliders: Vec::new(),
+            dirty: true,
+            voxel_scale: voxel_scale.max(0.05),
+        }
+    }
+
+    /// Converts a detached voxel cluster from structural collapse into an independent dynamic contraption.
+    pub fn from_cluster(
+        id: u64,
+        cluster: DetachedVoxelCluster,
+        parent_frame: ReferenceFrameId,
+        voxel_scale: f32,
+    ) -> Self {
+        let mut contraption = Self::new(
+            id,
+            RelativeTransform::new(parent_frame, IVec3::ZERO, cluster.origin_world.as_vec3() * voxel_scale),
+            voxel_scale,
+        );
+
+        for (rel_pos, block_id) in cluster.blocks {
+            contraption.set_block(rel_pos, block_id);
+        }
+
+        contraption
+    }
+
+    pub fn set_block(&mut self, local_world_pos: IVec3, id: BlockId) {
+        let (chunk_pos, [lx, ly, lz]) = world_to_chunk(local_world_pos);
+        let chunk_arc = self.chunks.entry(chunk_pos).or_insert_with(|| {
+            Arc::new(Chunk::empty())
+        });
+        let chunk = Arc::make_mut(chunk_arc);
+        chunk.set(lx, ly, lz, id);
+        self.dirty = true;
+    }
+
+    pub fn get_block(&self, local_world_pos: IVec3) -> BlockId {
+        let (chunk_pos, [lx, ly, lz]) = world_to_chunk(local_world_pos);
+        self.chunks.get(&chunk_pos).map_or(BlockId::AIR, |c| c.get(lx, ly, lz))
+    }
+
+    pub fn rebuild_colliders(&mut self) {
+        let mut all_boxes = Vec::new();
+        for (&pos, chunk) in &self.chunks {
+            let boxes = GreedyColliderBoxes::build_colliders(chunk, pos, self.voxel_scale);
+            all_boxes.extend(boxes);
+        }
+        self.colliders = all_boxes;
+    }
+
+    pub fn rebuild_meshes(&mut self, registry: &BlockRegistry) {
+        let mut new_meshes = HashMap::new();
+        let scale = self.voxel_scale;
+
+        for (&pos, _) in &self.chunks {
+            let mut neighborhood: ChunkNeighborhood = Default::default();
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    for dx in -1..=1 {
+                        let idx = ((dx + 1) + (dz + 1) * 3 + (dy + 1) * 9) as usize;
+                        neighborhood[idx] = self.chunks.get(&(pos + IVec3::new(dx, dy, dz))).cloned();
+                    }
+                }
+            }
+            let mesh = build_chunk_mesh(pos, &neighborhood, registry, scale);
+            if !mesh.is_empty() {
+                new_meshes.insert(pos, mesh);
+            }
+        }
+
+        self.meshes = new_meshes;
+        self.rebuild_colliders();
+        self.dirty = false;
+    }
+
+    /// Transforms a point from contraption local coordinates to world coordinates.
+    pub fn transform_point_to_world(&self, local_pt: Vec3) -> Vec3 {
+        self.transform.local_offset + self.transform.local_rotation * (local_pt * self.voxel_scale)
+    }
+
+    /// Transforms a point from world coordinates to contraption local coordinates.
+    pub fn transform_point_to_local(&self, world_pt: Vec3) -> Vec3 {
+        let rel = world_pt - self.transform.local_offset;
+        (self.transform.local_rotation.inverse() * rel) / self.voxel_scale
+    }
+}
+
 /// Multithreaded cubic-chunk voxel world with persistent block edits,
 /// Neighbor-Aware Meshing Gate, and compact delta storage.
 pub struct World {
@@ -263,6 +789,7 @@ pub struct World {
     pending_generation: HashSet<IVec3>,
     pending_meshing: HashSet<IVec3>,
     ready_meshes: Vec<(IVec3, ChunkMesh)>,
+    pub delta_pager: InfiniteDeltaPager,
     pub voxel_scale: f32,
     pub min_chunk_y: i32,
     pub max_chunk_y: i32,
@@ -284,6 +811,7 @@ impl World {
             pending_generation: HashSet::new(),
             pending_meshing: HashSet::new(),
             ready_meshes: Vec::new(),
+            delta_pager: InfiniteDeltaPager::default(),
             voxel_scale: 1.0,
             min_chunk_y: -3,
             max_chunk_y: 6,
@@ -314,7 +842,7 @@ impl World {
     }
 
     pub fn edit_count(&self) -> usize {
-        self.edits.values().map(|m| m.len()).sum()
+        self.edits.values().map(|m| m.len()).sum::<usize>() + self.delta_pager.total_saved_count()
     }
 
     pub fn status_of(&self, pos: IVec3) -> ChunkStatus {
@@ -339,6 +867,9 @@ impl World {
         if let Some(block) = self.edits.get(&chunk_pos).and_then(|m| m.get(lx, ly, lz)) {
             return block;
         }
+        if let Some(block) = self.delta_pager.peek(&chunk_pos).and_then(|m| m.get(lx, ly, lz)) {
+            return block;
+        }
         self.chunks
             .get(&chunk_pos)
             .map_or(BlockId::AIR, |chunk| chunk.get(lx, ly, lz))
@@ -355,15 +886,12 @@ impl World {
             Arc::new(Chunk::empty())
         });
         let chunk = Arc::make_mut(chunk_arc);
-        if chunk.get(lx, ly, lz) == id {
-            return;
-        }
         chunk.set(lx, ly, lz, id);
 
         self.statuses.insert(chunk_pos, ChunkStatus::Dirty);
         self.dirty_meshes.insert(chunk_pos);
 
-        // Boundary neighbor detection: if block is on border, mark adjacent chunk Dirty
+        // Boundary neighbor detection
         if lx == 0 {
             let n = chunk_pos + IVec3::new(-1, 0, 0);
             if self.chunks.contains_key(&n) {
@@ -407,19 +935,71 @@ impl World {
         }
     }
 
-    fn apply_edits_to_chunk(&self, chunk_pos: IVec3, chunk: &mut Chunk) {
-        let Some(chunk_edits) = self.edits.get(&chunk_pos) else {
-            return;
-        };
-        for &(code, id) in &chunk_edits.edits {
-            let (lx, ly, lz) = unpack_delta_index(code);
-            chunk.set(lx, ly, lz, id);
+    /// Breaks a block and performs a structural integrity BFS check, returning any detached falling clusters.
+    pub fn break_block_with_integrity(
+        &mut self,
+        pos: IVec3,
+        registry: &BlockRegistry,
+        materials: &MaterialRegistry,
+        ground_anchor_y: i32,
+    ) -> Vec<DetachedVoxelCluster> {
+        self.set_block(pos, BlockId::AIR);
+        StructuralIntegrityChecker::check_and_detach(self, pos, registry, materials, ground_anchor_y)
+    }
+
+    fn apply_edits_to_chunk(&mut self, chunk_pos: IVec3, chunk: &mut Chunk) {
+        if let Some(chunk_edits) = self.edits.get(&chunk_pos) {
+            for &(code, id) in &chunk_edits.edits {
+                let (lx, ly, lz) = unpack_delta_index(code);
+                chunk.set(lx, ly, lz, id);
+            }
+        } else if let Some(paged_delta) = self.delta_pager.page_in(chunk_pos) {
+            for &(code, id) in &paged_delta.edits {
+                let (lx, ly, lz) = unpack_delta_index(code);
+                chunk.set(lx, ly, lz, id);
+            }
+            self.edits.insert(chunk_pos, paged_delta);
         }
     }
 
     pub fn save_edits(&self, path: &Path, registry: &BlockRegistry) -> io::Result<usize> {
         let mut records: Vec<(IVec3, &str)> = Vec::new();
+        let mut seen = HashSet::new();
+
         for (&chunk_pos, chunk_edits) in &self.edits {
+            seen.insert(chunk_pos);
+            let base = chunk_pos * CHUNK_SIZE_I32;
+            for &(code, id) in &chunk_edits.edits {
+                let (lx, ly, lz) = unpack_delta_index(code);
+                let name = registry
+                    .get(id)
+                    .map(|d| d.name.as_str())
+                    .unwrap_or("core:air");
+                records.push((base + IVec3::new(lx as i32, ly as i32, lz as i32), name));
+            }
+        }
+
+        for (&chunk_pos, chunk_edits) in &self.delta_pager.cache {
+            if seen.contains(&chunk_pos) {
+                continue;
+            }
+            seen.insert(chunk_pos);
+            let base = chunk_pos * CHUNK_SIZE_I32;
+            for &(code, id) in &chunk_edits.edits {
+                let (lx, ly, lz) = unpack_delta_index(code);
+                let name = registry
+                    .get(id)
+                    .map(|d| d.name.as_str())
+                    .unwrap_or("core:air");
+                records.push((base + IVec3::new(lx as i32, ly as i32, lz as i32), name));
+            }
+        }
+
+        for (&chunk_pos, chunk_edits) in &self.delta_pager.disk_storage {
+            if seen.contains(&chunk_pos) {
+                continue;
+            }
+            seen.insert(chunk_pos);
             let base = chunk_pos * CHUNK_SIZE_I32;
             for &(code, id) in &chunk_edits.edits {
                 let (lx, ly, lz) = unpack_delta_index(code);
@@ -716,7 +1296,6 @@ impl World {
                         self.statuses.insert(pos, ChunkStatus::DataReady);
                         self.dirty_meshes.insert(pos);
 
-                        // Mark neighbors dirty so they can be meshed with this newly available neighbor
                         for dy in -1..=1 {
                             for dz in -1..=1 {
                                 for dx in -1..=1 {
@@ -746,7 +1325,7 @@ impl World {
             return Vec::new();
         }
 
-        // Distance-Priority Upload: sort ready meshes so closest to player upload first!
+        // Distance-Priority Upload: sort ready meshes so closest to player upload first
         self.ready_meshes.sort_unstable_by_key(|(p, _)| {
             let dx = p.x - center.x;
             let dy = p.y - center.y;
@@ -759,6 +1338,8 @@ impl World {
     }
 
     /// Unloads chunks outside `radius_xz + 2` around `center` and prunes stale upload meshes.
+    /// Pure procedural chunks are dropped immediately without disk baggage,
+    /// while chunks with player edits are managed via the LRU delta pager.
     pub fn unload_outside(&mut self, center: IVec3, radius_xz: i32) -> Vec<IVec3> {
         let keep = radius_xz + 2;
         let to_remove: Vec<IVec3> = self
@@ -780,9 +1361,15 @@ impl World {
             self.dirty_meshes.remove(pos);
             self.pending_generation.remove(pos);
             self.pending_meshing.remove(pos);
+
+            // Clean procedural eviction & LRU paging
+            if let Some(delta) = self.edits.remove(pos) {
+                if !delta.is_empty() {
+                    self.delta_pager.page_out(*pos, delta);
+                }
+            }
         }
 
-        // Prune stale meshes waiting in upload queue
         self.ready_meshes.retain(|(pos, _)| !to_remove_set.contains(pos));
 
         to_remove
@@ -948,346 +1535,351 @@ impl World {
 #[inline]
 fn get_block_in_neighborhood(
     neighborhood: &ChunkNeighborhood,
-    lx: i32,
-    ly: i32,
-    lz: i32,
+    gx: i32,
+    gy: i32,
+    gz: i32,
 ) -> BlockId {
-    let cx = if lx < 0 { 0 } else if lx >= CHUNK_SIZE_I32 { 2 } else { 1 };
-    let cy = if ly < 0 { 0 } else if ly >= CHUNK_SIZE_I32 { 2 } else { 1 };
-    let cz = if lz < 0 { 0 } else if lz >= CHUNK_SIZE_I32 { 2 } else { 1 };
-
-    let Some(chunk) = &neighborhood[cx + cz * 3 + cy * 9] else {
+    let cx = gx.div_euclid(CHUNK_SIZE_I32);
+    let cy = gy.div_euclid(CHUNK_SIZE_I32);
+    let cz = gz.div_euclid(CHUNK_SIZE_I32);
+    if cx < -1 || cx > 1 || cy < -1 || cy > 1 || cz < -1 || cz > 1 {
+        return BlockId::AIR;
+    }
+    let n_idx = ((cx + 1) + (cz + 1) * 3 + (cy + 1) * 9) as usize;
+    let Some(chunk) = &neighborhood[n_idx] else {
         return BlockId::AIR;
     };
-    let ux = (lx & 15) as usize;
-    let uy = (ly & 15) as usize;
-    let uz = (lz & 15) as usize;
-    chunk.get(ux, uy, uz)
+    let lx = gx.rem_euclid(CHUNK_SIZE_I32) as usize;
+    let ly = gy.rem_euclid(CHUNK_SIZE_I32) as usize;
+    let lz = gz.rem_euclid(CHUNK_SIZE_I32) as usize;
+    chunk.get(lx, ly, lz)
 }
 
 #[inline]
-fn is_opaque_in_neighborhood(
-    neighborhood: &ChunkNeighborhood,
+fn is_face_visible(
+    current_block: BlockId,
+    neighbor_block: BlockId,
     registry: &BlockRegistry,
-    lx: i32,
-    ly: i32,
-    lz: i32,
 ) -> bool {
-    let cx = if lx < 0 {
-        0
-    } else if lx >= CHUNK_SIZE_I32 {
-        2
-    } else {
-        1
-    };
-    let cy = if ly < 0 {
-        0
-    } else if ly >= CHUNK_SIZE_I32 {
-        2
-    } else {
-        1
-    };
-    let cz = if lz < 0 {
-        0
-    } else if lz >= CHUNK_SIZE_I32 {
-        2
-    } else {
-        1
-    };
-
-    let Some(chunk) = &neighborhood[cx + cz * 3 + cy * 9] else {
+    if neighbor_block == BlockId::AIR {
+        return true;
+    }
+    let Some(cur_def) = registry.get(current_block) else {
         return false;
     };
-    let ux = (lx & 15) as usize;
-    let uy = (ly & 15) as usize;
-    let uz = (lz & 15) as usize;
-    registry.is_opaque(chunk.get(ux, uy, uz))
-}
-
-#[inline]
-fn corner_ao_level(
-    neighborhood: &ChunkNeighborhood,
-    registry: &BlockRegistry,
-    face_voxel: [i32; 3],
-    normal: [i32; 3],
-    corner_mask: [i32; 3],
-) -> u8 {
-    let ox = if normal[0] != 0 { 0 } else if corner_mask[0] != 0 { 1 } else { -1 };
-    let oy = if normal[1] != 0 { 0 } else if corner_mask[1] != 0 { 1 } else { -1 };
-    let oz = if normal[2] != 0 { 0 } else if corner_mask[2] != 0 { 1 } else { -1 };
-
-    let (s1, s2) = if normal[0] != 0 {
-        ([0, oy, 0], [0, 0, oz])
-    } else if normal[1] != 0 {
-        ([ox, 0, 0], [0, 0, oz])
-    } else {
-        ([ox, 0, 0], [0, oy, 0])
+    let Some(nb_def) = registry.get(neighbor_block) else {
+        return true;
     };
 
-    let side1 = is_opaque_in_neighborhood(
-        neighborhood,
-        registry,
-        face_voxel[0] + s1[0],
-        face_voxel[1] + s1[1],
-        face_voxel[2] + s1[2],
-    );
-    let side2 = is_opaque_in_neighborhood(
-        neighborhood,
-        registry,
-        face_voxel[0] + s2[0],
-        face_voxel[1] + s2[1],
-        face_voxel[2] + s2[2],
-    );
-    let diag = is_opaque_in_neighborhood(
-        neighborhood,
-        registry,
-        face_voxel[0] + ox,
-        face_voxel[1] + oy,
-        face_voxel[2] + oz,
-    );
+    if cur_def.shading_model == ShadingModel::Water {
+        return neighbor_block == BlockId::AIR;
+    }
 
-    if side1 && side2 {
-        3
+    if cur_def.opaque {
+        !nb_def.opaque
     } else {
-        ((side1 as u8) + (side2 as u8) + (diag as u8)).min(3)
+        !nb_def.opaque && current_block != neighbor_block
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct GreedyFaceData {
-    id: BlockId,
-    ao_packed: u8,
+#[inline]
+fn compute_ao_level(side1: bool, side2: bool, corner: bool) -> u8 {
+    if side1 && side2 {
+        3
+    } else {
+        (side1 as u8) + (side2 as u8) + (corner as u8)
+    }
 }
 
-/// Builds high-performance chunk mesh with 2D Greedy Meshing.
-/// Adjacent coplanar faces with identical material and AO levels are merged into large quads.
-/// UV coordinates scale with quad dimensions for seamless repeat in Texture2DArray.
+fn compute_vertex_ao(
+    neighborhood: &ChunkNeighborhood,
+    registry: &BlockRegistry,
+    voxel: IVec3,
+    face: BlockFace,
+    corner_idx: usize,
+) -> u8 {
+    let (normal, u_axis, v_axis) = match face {
+        BlockFace::Top => (IVec3::Y, IVec3::X, IVec3::Z),
+        BlockFace::Bottom => (IVec3::NEG_Y, IVec3::X, IVec3::NEG_Z),
+        BlockFace::North => (IVec3::NEG_Z, IVec3::NEG_X, IVec3::Y),
+        BlockFace::South => (IVec3::Z, IVec3::X, IVec3::Y),
+        BlockFace::East => (IVec3::X, IVec3::NEG_Z, IVec3::Y),
+        BlockFace::West => (IVec3::NEG_X, IVec3::Z, IVec3::Y),
+    };
+
+    let (u_sign, v_sign) = match corner_idx {
+        0 => (-1, -1),
+        1 => (1, -1),
+        2 => (1, 1),
+        3 => (-1, 1),
+        _ => (0, 0),
+    };
+
+    let check_voxel = voxel + normal;
+    let side1_pos = check_voxel + u_axis * u_sign;
+    let side2_pos = check_voxel + v_axis * v_sign;
+    let corner_pos = check_voxel + u_axis * u_sign + v_axis * v_sign;
+
+    let b_side1 = get_block_in_neighborhood(neighborhood, side1_pos.x, side1_pos.y, side1_pos.z);
+    let b_side2 = get_block_in_neighborhood(neighborhood, side2_pos.x, side2_pos.y, side2_pos.z);
+    let b_corner = get_block_in_neighborhood(neighborhood, corner_pos.x, corner_pos.y, corner_pos.z);
+
+    let is_solid = |b: BlockId| {
+        if b == BlockId::AIR {
+            false
+        } else {
+            registry.get(b).is_some_and(|d| d.opaque)
+        }
+    };
+
+    compute_ao_level(is_solid(b_side1), is_solid(b_side2), is_solid(b_corner))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FaceVoxel {
+    block_id: BlockId,
+    ao_levels: [u8; 4],
+}
+
+/// 2D Greedy Meshing implementation merging coplanar adjacent quads with identical
+/// block definitions and matching baked AO corner levels into large quads.
 pub fn build_chunk_mesh(
     chunk_pos: IVec3,
     neighborhood: &ChunkNeighborhood,
     registry: &BlockRegistry,
     voxel_scale: f32,
 ) -> ChunkMesh {
-    let Some(chunk) = &neighborhood[13] else {
+    let center_idx = 1 + 3 + 9;
+    let Some(center_chunk) = &neighborhood[center_idx] else {
         return ChunkMesh::default();
     };
-    if chunk.is_empty() {
+    if center_chunk.is_empty() {
         return ChunkMesh::default();
     }
 
     let mut mesh = ChunkMesh::default();
-    let base_origin = (chunk_pos * CHUNK_SIZE_I32).as_vec3() * voxel_scale;
+    let chunk_base = (chunk_pos * CHUNK_SIZE_I32).as_vec3() * voxel_scale;
 
-    // Face configurations:
-    // (Face, normal_dir [nx, ny, nz], corner_masks)
-    let faces: [(BlockFace, [i32; 3], [[i32; 3]; 4]); 6] = [
-        (
-            BlockFace::Top,
-            [0, 1, 0],
-            [[0, 1, 1], [1, 1, 1], [1, 1, 0], [0, 1, 0]],
-        ),
-        (
-            BlockFace::Bottom,
-            [0, -1, 0],
-            [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],
-        ),
-        (
-            BlockFace::North,
-            [0, 0, -1],
-            [[1, 0, 0], [0, 0, 0], [0, 1, 0], [1, 1, 0]],
-        ),
-        (
-            BlockFace::South,
-            [0, 0, 1],
-            [[0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]],
-        ),
-        (
-            BlockFace::East,
-            [1, 0, 0],
-            [[1, 0, 1], [1, 0, 0], [1, 1, 0], [1, 1, 1]],
-        ),
-        (
-            BlockFace::West,
-            [-1, 0, 0],
-            [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],
-        ),
-    ];
+    for face in [
+        BlockFace::Top,
+        BlockFace::Bottom,
+        BlockFace::North,
+        BlockFace::South,
+        BlockFace::East,
+        BlockFace::West,
+    ] {
+        let (axis, dir, u_axis, v_axis) = match face {
+            BlockFace::Top => (1, 1, 0, 2),
+            BlockFace::Bottom => (1, -1, 0, 2),
+            BlockFace::North => (2, -1, 0, 1),
+            BlockFace::South => (2, 1, 0, 1),
+            BlockFace::East => (0, 1, 2, 1),
+            BlockFace::West => (0, -1, 2, 1),
+        };
 
-    for (face, norm_i, corner_masks) in faces {
-        let normal = [norm_i[0] as f32, norm_i[1] as f32, norm_i[2] as f32];
+        let normal = match face {
+            BlockFace::Top => [0.0, 1.0, 0.0],
+            BlockFace::Bottom => [0.0, -1.0, 0.0],
+            BlockFace::North => [0.0, 0.0, -1.0],
+            BlockFace::South => [0.0, 0.0, 1.0],
+            BlockFace::East => [1.0, 0.0, 0.0],
+            BlockFace::West => [-1.0, 0.0, 0.0],
+        };
 
-        // Slicing through chunk depth:
-        // Top/Bottom slices along Y (u=X, v=Z)
-        // North/South slices along Z (u=X, v=Y)
-        // East/West slices along X (u=Z, v=Y)
-        for slice in 0..CHUNK_SIZE {
-            let mut mask = [[None; CHUNK_SIZE]; CHUNK_SIZE];
+        for d in 0..CHUNK_SIZE {
+            let mut mask: [Option<FaceVoxel>; CHUNK_SIZE * CHUNK_SIZE] = [None; CHUNK_SIZE * CHUNK_SIZE];
 
             for v in 0..CHUNK_SIZE {
                 for u in 0..CHUNK_SIZE {
-                    let (x, y, z) = match face {
-                        BlockFace::Top | BlockFace::Bottom => (u, slice, v),
-                        BlockFace::North | BlockFace::South => (u, v, slice),
-                        BlockFace::East | BlockFace::West => (slice, v, u),
-                    };
+                    let mut local = [0usize; 3];
+                    local[axis] = d;
+                    local[u_axis] = u;
+                    local[v_axis] = v;
 
-                    let id = chunk.get(x, y, z);
-                    if id == BlockId::AIR {
-                        continue;
-                    }
-                    let Some(def) = registry.get(id) else {
-                        continue;
-                    };
-                    if !def.solid && def.shading_model != ShadingModel::Water {
+                    let block = center_chunk.get(local[0], local[1], local[2]);
+                    if block == BlockId::AIR {
                         continue;
                     }
 
-                    let face_voxel = [x as i32 + norm_i[0], y as i32 + norm_i[1], z as i32 + norm_i[2]];
-                    let neighbor_block = get_block_in_neighborhood(neighborhood, face_voxel[0], face_voxel[1], face_voxel[2]);
-                    if id == neighbor_block && def.transparency != BlockTransparency::Opaque {
-                        continue;
-                    }
-                    if is_opaque_in_neighborhood(neighborhood, registry, face_voxel[0], face_voxel[1], face_voxel[2]) {
-                        continue;
-                    }
+                    let mut neighbor_coord = [local[0] as i32, local[1] as i32, local[2] as i32];
+                    neighbor_coord[axis] += dir;
 
-                    // Pack the 4 corner AO levels into 1 byte (2 bits each)
-                    let mut ao_packed = 0u8;
-                    for (i, &cmask) in corner_masks.iter().enumerate() {
-                        let lvl = corner_ao_level(neighborhood, registry, face_voxel, norm_i, cmask);
-                        ao_packed |= (lvl & 3) << (i * 2);
-                    }
+                    let neighbor_block = get_block_in_neighborhood(
+                        neighborhood,
+                        neighbor_coord[0],
+                        neighbor_coord[1],
+                        neighbor_coord[2],
+                    );
 
-                    mask[u][v] = Some(GreedyFaceData { id, ao_packed });
+                    if is_face_visible(block, neighbor_block, registry) {
+                        let voxel_pos = IVec3::new(local[0] as i32, local[1] as i32, local[2] as i32);
+                        let ao0 = compute_vertex_ao(neighborhood, registry, voxel_pos, face, 0);
+                        let ao1 = compute_vertex_ao(neighborhood, registry, voxel_pos, face, 1);
+                        let ao2 = compute_vertex_ao(neighborhood, registry, voxel_pos, face, 2);
+                        let ao3 = compute_vertex_ao(neighborhood, registry, voxel_pos, face, 3);
+
+                        mask[u + v * CHUNK_SIZE] = Some(FaceVoxel {
+                            block_id: block,
+                            ao_levels: [ao0, ao1, ao2, ao3],
+                        });
+                    }
                 }
             }
 
-            // 2D Greedy Meshing pass on this slice
             for v in 0..CHUNK_SIZE {
-                for u in 0..CHUNK_SIZE {
-                    let Some(current) = mask[u][v] else {
+                let mut u = 0;
+                while u < CHUNK_SIZE {
+                    let Some(face_voxel) = mask[u + v * CHUNK_SIZE] else {
+                        u += 1;
                         continue;
                     };
 
-                    let Some(def) = registry.get(current.id) else {
-                        continue;
-                    };
+                    let cur_def = registry.get(face_voxel.block_id);
+                    let is_water = cur_def.map_or(false, |d| d.shading_model == ShadingModel::Water);
 
-                    // For water, avoid merging quads so sine-wave vertex displacements animate smoothly per block
-                    let is_water = def.shading_model == ShadingModel::Water;
-
-                    // 1. Determine width (U-extent)
                     let mut width = 1;
                     if !is_water {
-                        while u + width < CHUNK_SIZE && mask[u + width][v] == Some(current) {
-                            width += 1;
+                        while u + width < CHUNK_SIZE {
+                            if mask[(u + width) + v * CHUNK_SIZE] == Some(face_voxel) {
+                                width += 1;
+                            } else {
+                                break;
+                            }
                         }
                     }
 
-                    // 2. Determine height (V-extent)
                     let mut height = 1;
                     if !is_water {
-                        'v_loop: while v + height < CHUNK_SIZE {
+                        'find_height: while v + height < CHUNK_SIZE {
                             for k in 0..width {
-                                if mask[u + k][v + height] != Some(current) {
-                                    break 'v_loop;
+                                if mask[(u + k) + (v + height) * CHUNK_SIZE] != Some(face_voxel) {
+                                    break 'find_height;
                                 }
                             }
                             height += 1;
                         }
                     }
 
-                    // 3. Clear merged cells from mask
                     for dv in 0..height {
                         for du in 0..width {
-                            mask[u + du][v + dv] = None;
+                            mask[(u + du) + (v + dv) * CHUNK_SIZE] = None;
                         }
                     }
 
-                    // 4. Emit merged quad
+                    let def = cur_def.unwrap();
                     let color = def.face_colors[face as usize];
                     let tex_id = def.face_textures[face as usize] as u32;
-                    let base_idx = mesh.vertices.len() as u32;
 
-                    let ao0 = AO_CURVE[((current.ao_packed >> 0) & 3) as usize];
-                    let ao1 = AO_CURVE[((current.ao_packed >> 2) & 3) as usize];
-                    let ao2 = AO_CURVE[((current.ao_packed >> 4) & 3) as usize];
-                    let ao3 = AO_CURVE[((current.ao_packed >> 6) & 3) as usize];
+                    let face_idx = face as usize;
+                    let mat_id = def.face_materials[face_idx];
+                    let mat_roughness = def.roughness;
+                    let mat_metallic = def.metallic;
+                    let mat_emission = def.emission[0].max(def.emission[1]).max(def.emission[2]);
+                    let mat_params = [mat_roughness, mat_metallic, mat_id.0 as f32, mat_emission];
 
-                    let w_f = width as f32;
-                    let h_f = height as f32;
+                    let offset_axis = if dir > 0 { (d + 1) as f32 } else { d as f32 };
+                    let (u_min, u_max) = (u as f32, (u + width) as f32);
+                    let (v_min, v_max) = (v as f32, (v + height) as f32);
 
-                    // Compute 4 corner positions in world space
-                    let corners_local: [[f32; 3]; 4] = match face {
-                        BlockFace::Top => [
-                            [u as f32, (slice + 1) as f32, (v + height) as f32],
-                            [(u + width) as f32, (slice + 1) as f32, (v + height) as f32],
-                            [(u + width) as f32, (slice + 1) as f32, v as f32],
-                            [u as f32, (slice + 1) as f32, v as f32],
-                        ],
-                        BlockFace::Bottom => [
-                            [u as f32, slice as f32, v as f32],
-                            [(u + width) as f32, slice as f32, v as f32],
-                            [(u + width) as f32, slice as f32, (v + height) as f32],
-                            [u as f32, slice as f32, (v + height) as f32],
-                        ],
-                        BlockFace::North => [
-                            [(u + width) as f32, v as f32, slice as f32],
-                            [u as f32, v as f32, slice as f32],
-                            [u as f32, (v + height) as f32, slice as f32],
-                            [(u + width) as f32, (v + height) as f32, slice as f32],
-                        ],
-                        BlockFace::South => [
-                            [u as f32, v as f32, (slice + 1) as f32],
-                            [(u + width) as f32, v as f32, (slice + 1) as f32],
-                            [(u + width) as f32, (v + height) as f32, (slice + 1) as f32],
-                            [u as f32, (v + height) as f32, (slice + 1) as f32],
-                        ],
-                        BlockFace::East => [
-                            [(slice + 1) as f32, v as f32, (u + width) as f32],
-                            [(slice + 1) as f32, v as f32, u as f32],
-                            [(slice + 1) as f32, (v + height) as f32, u as f32],
-                            [(slice + 1) as f32, (v + height) as f32, (u + width) as f32],
-                        ],
-                        BlockFace::West => [
-                            [slice as f32, v as f32, u as f32],
-                            [slice as f32, v as f32, (u + width) as f32],
-                            [slice as f32, (v + height) as f32, (u + width) as f32],
-                            [slice as f32, (v + height) as f32, u as f32],
-                        ],
-                    };
+                    let mut p0 = [0.0f32; 3];
+                    let mut p1 = [0.0f32; 3];
+                    let mut p2 = [0.0f32; 3];
+                    let mut p3 = [0.0f32; 3];
 
-                    let uvs: [[f32; 2]; 4] = [
-                        [0.0, h_f],
-                        [w_f, h_f],
-                        [w_f, 0.0],
-                        [0.0, 0.0],
-                    ];
-                    let aos = [ao0, ao1, ao2, ao3];
+                    p0[axis] = offset_axis;
+                    p1[axis] = offset_axis;
+                    p2[axis] = offset_axis;
+                    p3[axis] = offset_axis;
 
-                    for i in 0..4 {
-                        mesh.vertices.push(VoxelVertex {
-                            position: [
-                                base_origin.x + corners_local[i][0] * voxel_scale,
-                                base_origin.y + corners_local[i][1] * voxel_scale,
-                                base_origin.z + corners_local[i][2] * voxel_scale,
-                            ],
-                            normal,
-                            color,
-                            ao: aos[i],
-                            uv: uvs[i],
-                            tex_id,
-                            material_params: [
-                                def.roughness,
-                                def.metallic,
-                                def.shading_model as u32 as f32,
-                                def.subsurface,
-                            ],
-                        });
+                    match face {
+                        BlockFace::Top => {
+                            p0[0] = u_min; p0[2] = v_min;
+                            p1[0] = u_max; p1[2] = v_min;
+                            p2[0] = u_max; p2[2] = v_max;
+                            p3[0] = u_min; p3[2] = v_max;
+                        }
+                        BlockFace::Bottom => {
+                            p0[0] = u_min; p0[2] = v_max;
+                            p1[0] = u_max; p1[2] = v_max;
+                            p2[0] = u_max; p2[2] = v_min;
+                            p3[0] = u_min; p3[2] = v_min;
+                        }
+                        BlockFace::North => {
+                            p0[0] = u_max; p0[1] = v_min;
+                            p1[0] = u_min; p1[1] = v_min;
+                            p2[0] = u_min; p2[1] = v_max;
+                            p3[0] = u_max; p3[1] = v_max;
+                        }
+                        BlockFace::South => {
+                            p0[0] = u_min; p0[1] = v_min;
+                            p1[0] = u_max; p1[1] = v_min;
+                            p2[0] = u_max; p2[1] = v_max;
+                            p3[0] = u_min; p3[1] = v_max;
+                        }
+                        BlockFace::East => {
+                            p0[2] = u_min; p0[1] = v_min;
+                            p1[2] = u_max; p1[1] = v_min;
+                            p2[2] = u_max; p2[1] = v_max;
+                            p3[2] = u_min; p3[1] = v_max;
+                        }
+                        BlockFace::West => {
+                            p0[2] = u_max; p0[1] = v_min;
+                            p1[2] = u_min; p1[1] = v_min;
+                            p2[2] = u_min; p2[1] = v_max;
+                            p3[2] = u_max; p3[1] = v_max;
+                        }
                     }
 
-                    // Flip quad triangulation if diagonal AO gradient would crease
-                    if aos[0] + aos[2] < aos[1] + aos[3] {
+                    let v0 = chunk_base + Vec3::from_array(p0) * voxel_scale;
+                    let v1 = chunk_base + Vec3::from_array(p1) * voxel_scale;
+                    let v2 = chunk_base + Vec3::from_array(p2) * voxel_scale;
+                    let v3 = chunk_base + Vec3::from_array(p3) * voxel_scale;
+
+                    let u_scale = width as f32;
+                    let v_scale = height as f32;
+
+                    let base_idx = mesh.vertices.len() as u32;
+                    let ao = face_voxel.ao_levels;
+
+                    mesh.vertices.push(VoxelVertex {
+                        position: v0.to_array(),
+                        normal,
+                        color,
+                        ao: AO_CURVE[ao[0] as usize],
+                        uv: [0.0, 0.0],
+                        tex_id,
+                        material_params: mat_params,
+                    });
+                    mesh.vertices.push(VoxelVertex {
+                        position: v1.to_array(),
+                        normal,
+                        color,
+                        ao: AO_CURVE[ao[1] as usize],
+                        uv: [u_scale, 0.0],
+                        tex_id,
+                        material_params: mat_params,
+                    });
+                    mesh.vertices.push(VoxelVertex {
+                        position: v2.to_array(),
+                        normal,
+                        color,
+                        ao: AO_CURVE[ao[2] as usize],
+                        uv: [u_scale, v_scale],
+                        tex_id,
+                        material_params: mat_params,
+                    });
+                    mesh.vertices.push(VoxelVertex {
+                        position: v3.to_array(),
+                        normal,
+                        color,
+                        ao: AO_CURVE[ao[3] as usize],
+                        uv: [0.0, v_scale],
+                        tex_id,
+                        material_params: mat_params,
+                    });
+
+                    // AO interpolation diagonal flip
+                    if (ao[0] as i32 + ao[2] as i32) > (ao[1] as i32 + ao[3] as i32) {
                         mesh.indices.extend_from_slice(&[
                             base_idx + 1,
                             base_idx + 2,
@@ -1306,6 +1898,8 @@ pub fn build_chunk_mesh(
                             base_idx + 3,
                         ]);
                     }
+
+                    u += width;
                 }
             }
         }
@@ -1331,7 +1925,7 @@ mod tests {
 
         let mut world = World::new();
         world.set_block(IVec3::new(5, 5, 5), stone);
-        world.set_block(IVec3::new(4, 6, 5), stone); // side neighbor above-west
+        world.set_block(IVec3::new(4, 6, 5), stone);
 
         let meshes = world.rebuild_dirty_meshes(&reg, 8);
         assert!(!meshes.is_empty());
@@ -1381,7 +1975,6 @@ mod tests {
         ));
 
         let mut world = World::new();
-        // Fill a 4x4 flat plane of grass
         for z in 0..4 {
             for x in 0..4 {
                 world.set_block(IVec3::new(x, 0, z), grass);
@@ -1391,7 +1984,98 @@ mod tests {
         let meshes = world.rebuild_dirty_meshes(&reg, 1);
         assert!(!meshes.is_empty());
         let top_faces: Vec<_> = meshes[0].1.vertices.iter().filter(|v| v.normal[1] > 0.9).collect();
-        // A merged 4x4 top face should emit only 4 vertices (1 quad) instead of 16 quads (64 vertices)!
         assert_eq!(top_faces.len(), 4);
+    }
+
+    #[test]
+    fn spatial_hash_and_infinite_coord_folding() {
+        let (s1, l1) = sample_infinite_coord(0);
+        assert_eq!((s1, l1), (0, 0));
+
+        let (s2, l2) = sample_infinite_coord(INFINITE_PERIOD * 3 + 42);
+        assert_eq!((s2, l2), (3, 42));
+
+        let (s3, l3) = sample_infinite_coord(-50);
+        assert_eq!(s3, -1);
+        assert_eq!(l3, (INFINITE_PERIOD - 50) as i32);
+
+        let h1 = spatial_hash_i64(10, 20, 30, 1337);
+        let h2 = spatial_hash_i64(10, 20, 30, 1337);
+        let h3 = spatial_hash_i64(11, 20, 30, 1337);
+        assert_eq!(h1, h2);
+        assert_ne!(h1, h3);
+    }
+
+    #[test]
+    fn delta_pager_lru_eviction() {
+        let mut pager = InfiniteDeltaPager::new(2);
+
+        let mut d1 = ChunkDelta::new();
+        d1.set(0, 0, 0, BlockId(1));
+        let mut d2 = ChunkDelta::new();
+        d2.set(1, 1, 1, BlockId(2));
+        let mut d3 = ChunkDelta::new();
+        d3.set(2, 2, 2, BlockId(3));
+
+        pager.page_out(IVec3::new(0, 0, 0), d1);
+        pager.page_out(IVec3::new(1, 0, 0), d2);
+        pager.page_out(IVec3::new(2, 0, 0), d3);
+
+        assert_eq!(pager.total_saved_count(), 3);
+        assert!(pager.disk_storage.contains_key(&IVec3::new(0, 0, 0)));
+
+        let restored = pager.page_in(IVec3::new(0, 0, 0)).expect("should restore from disk storage");
+        assert_eq!(restored.get(0, 0, 0), Some(BlockId(1)));
+    }
+
+    #[test]
+    fn structural_integrity_bfs_detaches_floating_voxels() {
+        let mut reg = BlockRegistry::new();
+        let stone = reg.register(BlockDef::solid_tinted(
+            "test:stone",
+            [0.5, 0.5, 0.5],
+            [0.5, 0.5, 0.5],
+            [0.5, 0.5, 0.5],
+        ));
+        let mat_reg = MaterialRegistry::new();
+
+        let mut world = World::new();
+        // Create a vertical pillar of stone from ground Y=0 to Y=3
+        world.set_block(IVec3::new(0, 0, 0), stone);
+        world.set_block(IVec3::new(0, 1, 0), stone);
+        world.set_block(IVec3::new(0, 2, 0), stone);
+        world.set_block(IVec3::new(0, 3, 0), stone);
+
+        // Break support at Y=1. Y=2 and Y=3 should become detached!
+        let detached = world.break_block_with_integrity(IVec3::new(0, 1, 0), &reg, &mat_reg, 0);
+
+        assert_eq!(detached.len(), 1);
+        assert_eq!(detached[0].blocks.len(), 2); // blocks at Y=2 and Y=3
+        assert_eq!(world.get_block(IVec3::new(0, 2, 0)), BlockId::AIR);
+        assert_eq!(world.get_block(IVec3::new(0, 3, 0)), BlockId::AIR);
+    }
+
+    #[test]
+    fn voxel_contraption_greedy_colliders() {
+        let mut contraption = VoxelContraption::new(
+            1,
+            RelativeTransform::default(),
+            1.0,
+        );
+
+        // Build a 2x2x2 solid cube
+        for x in 0..2 {
+            for y in 0..2 {
+                for z in 0..2 {
+                    contraption.set_block(IVec3::new(x, y, z), BlockId(1));
+                }
+            }
+        }
+
+        contraption.rebuild_colliders();
+        // A solid 2x2x2 cube should merge into exactly 1 bounding box!
+        assert_eq!(contraption.colliders.len(), 1);
+        assert_eq!(contraption.colliders[0].min, Vec3::ZERO);
+        assert_eq!(contraption.colliders[0].max, Vec3::new(2.0, 2.0, 2.0));
     }
 }

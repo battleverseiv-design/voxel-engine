@@ -8,7 +8,7 @@ use std::thread::{self, JoinHandle};
 
 use bytemuck::{Pod, Zeroable};
 use engine_core::{
-    BlockFace, BlockId, BlockRegistry, MaterialRegistry,
+    BlockFace, BlockId, BlockRegistry, BlockTransparency, MaterialRegistry,
     ReferenceFrameId, RelativeTransform, ShadingModel, WorldGenerator,
 };
 use glam::{IVec3, Vec3};
@@ -1535,351 +1535,346 @@ impl World {
 #[inline]
 fn get_block_in_neighborhood(
     neighborhood: &ChunkNeighborhood,
-    gx: i32,
-    gy: i32,
-    gz: i32,
+    lx: i32,
+    ly: i32,
+    lz: i32,
 ) -> BlockId {
-    let cx = gx.div_euclid(CHUNK_SIZE_I32);
-    let cy = gy.div_euclid(CHUNK_SIZE_I32);
-    let cz = gz.div_euclid(CHUNK_SIZE_I32);
-    if cx < -1 || cx > 1 || cy < -1 || cy > 1 || cz < -1 || cz > 1 {
-        return BlockId::AIR;
-    }
-    let n_idx = ((cx + 1) + (cz + 1) * 3 + (cy + 1) * 9) as usize;
-    let Some(chunk) = &neighborhood[n_idx] else {
+    let cx = if lx < 0 { 0 } else if lx >= CHUNK_SIZE_I32 { 2 } else { 1 };
+    let cy = if ly < 0 { 0 } else if ly >= CHUNK_SIZE_I32 { 2 } else { 1 };
+    let cz = if lz < 0 { 0 } else if lz >= CHUNK_SIZE_I32 { 2 } else { 1 };
+
+    let Some(chunk) = &neighborhood[cx + cz * 3 + cy * 9] else {
         return BlockId::AIR;
     };
-    let lx = gx.rem_euclid(CHUNK_SIZE_I32) as usize;
-    let ly = gy.rem_euclid(CHUNK_SIZE_I32) as usize;
-    let lz = gz.rem_euclid(CHUNK_SIZE_I32) as usize;
-    chunk.get(lx, ly, lz)
+    let ux = (lx & 15) as usize;
+    let uy = (ly & 15) as usize;
+    let uz = (lz & 15) as usize;
+    chunk.get(ux, uy, uz)
 }
 
 #[inline]
-fn is_face_visible(
-    current_block: BlockId,
-    neighbor_block: BlockId,
+fn is_opaque_in_neighborhood(
+    neighborhood: &ChunkNeighborhood,
     registry: &BlockRegistry,
+    lx: i32,
+    ly: i32,
+    lz: i32,
 ) -> bool {
-    if neighbor_block == BlockId::AIR {
-        return true;
-    }
-    let Some(cur_def) = registry.get(current_block) else {
+    let cx = if lx < 0 {
+        0
+    } else if lx >= CHUNK_SIZE_I32 {
+        2
+    } else {
+        1
+    };
+    let cy = if ly < 0 {
+        0
+    } else if ly >= CHUNK_SIZE_I32 {
+        2
+    } else {
+        1
+    };
+    let cz = if lz < 0 {
+        0
+    } else if lz >= CHUNK_SIZE_I32 {
+        2
+    } else {
+        1
+    };
+
+    let Some(chunk) = &neighborhood[cx + cz * 3 + cy * 9] else {
         return false;
     };
-    let Some(nb_def) = registry.get(neighbor_block) else {
-        return true;
-    };
-
-    if cur_def.shading_model == ShadingModel::Water {
-        return neighbor_block == BlockId::AIR;
-    }
-
-    if cur_def.opaque {
-        !nb_def.opaque
-    } else {
-        !nb_def.opaque && current_block != neighbor_block
-    }
+    let ux = (lx & 15) as usize;
+    let uy = (ly & 15) as usize;
+    let uz = (lz & 15) as usize;
+    registry.is_opaque(chunk.get(ux, uy, uz))
 }
 
 #[inline]
-fn compute_ao_level(side1: bool, side2: bool, corner: bool) -> u8 {
+fn corner_ao_level(
+    neighborhood: &ChunkNeighborhood,
+    registry: &BlockRegistry,
+    face_voxel: [i32; 3],
+    normal: [i32; 3],
+    corner_mask: [i32; 3],
+) -> u8 {
+    let ox = if normal[0] != 0 { 0 } else if corner_mask[0] != 0 { 1 } else { -1 };
+    let oy = if normal[1] != 0 { 0 } else if corner_mask[1] != 0 { 1 } else { -1 };
+    let oz = if normal[2] != 0 { 0 } else if corner_mask[2] != 0 { 1 } else { -1 };
+
+    let (s1, s2) = if normal[0] != 0 {
+        ([0, oy, 0], [0, 0, oz])
+    } else if normal[1] != 0 {
+        ([ox, 0, 0], [0, 0, oz])
+    } else {
+        ([ox, 0, 0], [0, oy, 0])
+    };
+
+    let side1 = is_opaque_in_neighborhood(
+        neighborhood,
+        registry,
+        face_voxel[0] + s1[0],
+        face_voxel[1] + s1[1],
+        face_voxel[2] + s1[2],
+    );
+    let side2 = is_opaque_in_neighborhood(
+        neighborhood,
+        registry,
+        face_voxel[0] + s2[0],
+        face_voxel[1] + s2[1],
+        face_voxel[2] + s2[2],
+    );
+    let diag = is_opaque_in_neighborhood(
+        neighborhood,
+        registry,
+        face_voxel[0] + ox,
+        face_voxel[1] + oy,
+        face_voxel[2] + oz,
+    );
+
     if side1 && side2 {
         3
     } else {
-        (side1 as u8) + (side2 as u8) + (corner as u8)
+        ((side1 as u8) + (side2 as u8) + (diag as u8)).min(3)
     }
 }
 
-fn compute_vertex_ao(
-    neighborhood: &ChunkNeighborhood,
-    registry: &BlockRegistry,
-    voxel: IVec3,
-    face: BlockFace,
-    corner_idx: usize,
-) -> u8 {
-    let (normal, u_axis, v_axis) = match face {
-        BlockFace::Top => (IVec3::Y, IVec3::X, IVec3::Z),
-        BlockFace::Bottom => (IVec3::NEG_Y, IVec3::X, IVec3::NEG_Z),
-        BlockFace::North => (IVec3::NEG_Z, IVec3::NEG_X, IVec3::Y),
-        BlockFace::South => (IVec3::Z, IVec3::X, IVec3::Y),
-        BlockFace::East => (IVec3::X, IVec3::NEG_Z, IVec3::Y),
-        BlockFace::West => (IVec3::NEG_X, IVec3::Z, IVec3::Y),
-    };
-
-    let (u_sign, v_sign) = match corner_idx {
-        0 => (-1, -1),
-        1 => (1, -1),
-        2 => (1, 1),
-        3 => (-1, 1),
-        _ => (0, 0),
-    };
-
-    let check_voxel = voxel + normal;
-    let side1_pos = check_voxel + u_axis * u_sign;
-    let side2_pos = check_voxel + v_axis * v_sign;
-    let corner_pos = check_voxel + u_axis * u_sign + v_axis * v_sign;
-
-    let b_side1 = get_block_in_neighborhood(neighborhood, side1_pos.x, side1_pos.y, side1_pos.z);
-    let b_side2 = get_block_in_neighborhood(neighborhood, side2_pos.x, side2_pos.y, side2_pos.z);
-    let b_corner = get_block_in_neighborhood(neighborhood, corner_pos.x, corner_pos.y, corner_pos.z);
-
-    let is_solid = |b: BlockId| {
-        if b == BlockId::AIR {
-            false
-        } else {
-            registry.get(b).is_some_and(|d| d.opaque)
-        }
-    };
-
-    compute_ao_level(is_solid(b_side1), is_solid(b_side2), is_solid(b_corner))
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct FaceVoxel {
-    block_id: BlockId,
-    ao_levels: [u8; 4],
+struct GreedyFaceData {
+    id: BlockId,
+    ao_packed: u8,
 }
 
-/// 2D Greedy Meshing implementation merging coplanar adjacent quads with identical
-/// block definitions and matching baked AO corner levels into large quads.
+/// Builds high-performance chunk mesh with 2D Greedy Meshing.
+/// Adjacent coplanar faces with identical material and AO levels are merged into large quads.
+/// UV coordinates scale with quad dimensions for seamless repeat in Texture2DArray.
 pub fn build_chunk_mesh(
     chunk_pos: IVec3,
     neighborhood: &ChunkNeighborhood,
     registry: &BlockRegistry,
     voxel_scale: f32,
 ) -> ChunkMesh {
-    let center_idx = 1 + 3 + 9;
-    let Some(center_chunk) = &neighborhood[center_idx] else {
+    let Some(chunk) = &neighborhood[13] else {
         return ChunkMesh::default();
     };
-    if center_chunk.is_empty() {
+    if chunk.is_empty() {
         return ChunkMesh::default();
     }
 
     let mut mesh = ChunkMesh::default();
-    let chunk_base = (chunk_pos * CHUNK_SIZE_I32).as_vec3() * voxel_scale;
+    let base_origin = (chunk_pos * CHUNK_SIZE_I32).as_vec3() * voxel_scale;
 
-    for face in [
-        BlockFace::Top,
-        BlockFace::Bottom,
-        BlockFace::North,
-        BlockFace::South,
-        BlockFace::East,
-        BlockFace::West,
-    ] {
-        let (axis, dir, u_axis, v_axis) = match face {
-            BlockFace::Top => (1, 1, 0, 2),
-            BlockFace::Bottom => (1, -1, 0, 2),
-            BlockFace::North => (2, -1, 0, 1),
-            BlockFace::South => (2, 1, 0, 1),
-            BlockFace::East => (0, 1, 2, 1),
-            BlockFace::West => (0, -1, 2, 1),
-        };
+    // Face configurations:
+    // (Face, normal_dir [nx, ny, nz], corner_masks)
+    let faces: [(BlockFace, [i32; 3], [[i32; 3]; 4]); 6] = [
+        (
+            BlockFace::Top,
+            [0, 1, 0],
+            [[0, 1, 1], [1, 1, 1], [1, 1, 0], [0, 1, 0]],
+        ),
+        (
+            BlockFace::Bottom,
+            [0, -1, 0],
+            [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],
+        ),
+        (
+            BlockFace::North,
+            [0, 0, -1],
+            [[1, 0, 0], [0, 0, 0], [0, 1, 0], [1, 1, 0]],
+        ),
+        (
+            BlockFace::South,
+            [0, 0, 1],
+            [[0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]],
+        ),
+        (
+            BlockFace::East,
+            [1, 0, 0],
+            [[1, 0, 1], [1, 0, 0], [1, 1, 0], [1, 1, 1]],
+        ),
+        (
+            BlockFace::West,
+            [-1, 0, 0],
+            [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],
+        ),
+    ];
 
-        let normal = match face {
-            BlockFace::Top => [0.0, 1.0, 0.0],
-            BlockFace::Bottom => [0.0, -1.0, 0.0],
-            BlockFace::North => [0.0, 0.0, -1.0],
-            BlockFace::South => [0.0, 0.0, 1.0],
-            BlockFace::East => [1.0, 0.0, 0.0],
-            BlockFace::West => [-1.0, 0.0, 0.0],
-        };
+    for (face, norm_i, corner_masks) in faces {
+        let normal = [norm_i[0] as f32, norm_i[1] as f32, norm_i[2] as f32];
 
-        for d in 0..CHUNK_SIZE {
-            let mut mask: [Option<FaceVoxel>; CHUNK_SIZE * CHUNK_SIZE] = [None; CHUNK_SIZE * CHUNK_SIZE];
+        // Slicing through chunk depth:
+        // Top/Bottom slices along Y (u=X, v=Z)
+        // North/South slices along Z (u=X, v=Y)
+        // East/West slices along X (u=Z, v=Y)
+        for slice in 0..CHUNK_SIZE {
+            let mut mask = [[None; CHUNK_SIZE]; CHUNK_SIZE];
 
             for v in 0..CHUNK_SIZE {
                 for u in 0..CHUNK_SIZE {
-                    let mut local = [0usize; 3];
-                    local[axis] = d;
-                    local[u_axis] = u;
-                    local[v_axis] = v;
+                    let (x, y, z) = match face {
+                        BlockFace::Top | BlockFace::Bottom => (u, slice, v),
+                        BlockFace::North | BlockFace::South => (u, v, slice),
+                        BlockFace::East | BlockFace::West => (slice, v, u),
+                    };
 
-                    let block = center_chunk.get(local[0], local[1], local[2]);
-                    if block == BlockId::AIR {
+                    let id = chunk.get(x, y, z);
+                    if id == BlockId::AIR {
+                        continue;
+                    }
+                    let Some(def) = registry.get(id) else {
+                        continue;
+                    };
+                    if !def.solid && def.shading_model != ShadingModel::Water {
                         continue;
                     }
 
-                    let mut neighbor_coord = [local[0] as i32, local[1] as i32, local[2] as i32];
-                    neighbor_coord[axis] += dir;
-
-                    let neighbor_block = get_block_in_neighborhood(
-                        neighborhood,
-                        neighbor_coord[0],
-                        neighbor_coord[1],
-                        neighbor_coord[2],
-                    );
-
-                    if is_face_visible(block, neighbor_block, registry) {
-                        let voxel_pos = IVec3::new(local[0] as i32, local[1] as i32, local[2] as i32);
-                        let ao0 = compute_vertex_ao(neighborhood, registry, voxel_pos, face, 0);
-                        let ao1 = compute_vertex_ao(neighborhood, registry, voxel_pos, face, 1);
-                        let ao2 = compute_vertex_ao(neighborhood, registry, voxel_pos, face, 2);
-                        let ao3 = compute_vertex_ao(neighborhood, registry, voxel_pos, face, 3);
-
-                        mask[u + v * CHUNK_SIZE] = Some(FaceVoxel {
-                            block_id: block,
-                            ao_levels: [ao0, ao1, ao2, ao3],
-                        });
+                    let face_voxel = [x as i32 + norm_i[0], y as i32 + norm_i[1], z as i32 + norm_i[2]];
+                    let neighbor_block = get_block_in_neighborhood(neighborhood, face_voxel[0], face_voxel[1], face_voxel[2]);
+                    if id == neighbor_block && def.transparency != BlockTransparency::Opaque {
+                        continue;
                     }
+                    if is_opaque_in_neighborhood(neighborhood, registry, face_voxel[0], face_voxel[1], face_voxel[2]) {
+                        continue;
+                    }
+
+                    // Pack the 4 corner AO levels into 1 byte (2 bits each)
+                    let mut ao_packed = 0u8;
+                    for (i, &cmask) in corner_masks.iter().enumerate() {
+                        let lvl = corner_ao_level(neighborhood, registry, face_voxel, norm_i, cmask);
+                        ao_packed |= (lvl & 3) << (i * 2);
+                    }
+
+                    mask[u][v] = Some(GreedyFaceData { id, ao_packed });
                 }
             }
 
+            // 2D Greedy Meshing pass on this slice
             for v in 0..CHUNK_SIZE {
-                let mut u = 0;
-                while u < CHUNK_SIZE {
-                    let Some(face_voxel) = mask[u + v * CHUNK_SIZE] else {
-                        u += 1;
+                for u in 0..CHUNK_SIZE {
+                    let Some(current) = mask[u][v] else {
                         continue;
                     };
 
-                    let cur_def = registry.get(face_voxel.block_id);
-                    let is_water = cur_def.map_or(false, |d| d.shading_model == ShadingModel::Water);
+                    let Some(def) = registry.get(current.id) else {
+                        continue;
+                    };
 
+                    // For water, avoid merging quads so sine-wave vertex displacements animate smoothly per block
+                    let is_water = def.shading_model == ShadingModel::Water;
+
+                    // 1. Determine width (U-extent)
                     let mut width = 1;
                     if !is_water {
-                        while u + width < CHUNK_SIZE {
-                            if mask[(u + width) + v * CHUNK_SIZE] == Some(face_voxel) {
-                                width += 1;
-                            } else {
-                                break;
-                            }
+                        while u + width < CHUNK_SIZE && mask[u + width][v] == Some(current) {
+                            width += 1;
                         }
                     }
 
+                    // 2. Determine height (V-extent)
                     let mut height = 1;
                     if !is_water {
-                        'find_height: while v + height < CHUNK_SIZE {
+                        'v_loop: while v + height < CHUNK_SIZE {
                             for k in 0..width {
-                                if mask[(u + k) + (v + height) * CHUNK_SIZE] != Some(face_voxel) {
-                                    break 'find_height;
+                                if mask[u + k][v + height] != Some(current) {
+                                    break 'v_loop;
                                 }
                             }
                             height += 1;
                         }
                     }
 
+                    // 3. Clear merged cells from mask
                     for dv in 0..height {
                         for du in 0..width {
-                            mask[(u + du) + (v + dv) * CHUNK_SIZE] = None;
+                            mask[u + du][v + dv] = None;
                         }
                     }
 
-                    let def = cur_def.unwrap();
+                    // 4. Emit merged quad
                     let color = def.face_colors[face as usize];
                     let tex_id = def.face_textures[face as usize] as u32;
+                    let base_idx = mesh.vertices.len() as u32;
 
-                    let face_idx = face as usize;
-                    let mat_id = def.face_materials[face_idx];
-                    let mat_roughness = def.roughness;
-                    let mat_metallic = def.metallic;
-                    let mat_emission = def.emission[0].max(def.emission[1]).max(def.emission[2]);
-                    let mat_params = [mat_roughness, mat_metallic, mat_id.0 as f32, mat_emission];
+                    let ao0 = AO_CURVE[((current.ao_packed >> 0) & 3) as usize];
+                    let ao1 = AO_CURVE[((current.ao_packed >> 2) & 3) as usize];
+                    let ao2 = AO_CURVE[((current.ao_packed >> 4) & 3) as usize];
+                    let ao3 = AO_CURVE[((current.ao_packed >> 6) & 3) as usize];
 
-                    let offset_axis = if dir > 0 { (d + 1) as f32 } else { d as f32 };
-                    let (u_min, u_max) = (u as f32, (u + width) as f32);
-                    let (v_min, v_max) = (v as f32, (v + height) as f32);
+                    let w_f = width as f32;
+                    let h_f = height as f32;
 
-                    let mut p0 = [0.0f32; 3];
-                    let mut p1 = [0.0f32; 3];
-                    let mut p2 = [0.0f32; 3];
-                    let mut p3 = [0.0f32; 3];
+                    // Compute 4 corner positions in world space
+                    let corners_local: [[f32; 3]; 4] = match face {
+                        BlockFace::Top => [
+                            [u as f32, (slice + 1) as f32, (v + height) as f32],
+                            [(u + width) as f32, (slice + 1) as f32, (v + height) as f32],
+                            [(u + width) as f32, (slice + 1) as f32, v as f32],
+                            [u as f32, (slice + 1) as f32, v as f32],
+                        ],
+                        BlockFace::Bottom => [
+                            [u as f32, slice as f32, v as f32],
+                            [(u + width) as f32, slice as f32, v as f32],
+                            [(u + width) as f32, slice as f32, (v + height) as f32],
+                            [u as f32, slice as f32, (v + height) as f32],
+                        ],
+                        BlockFace::North => [
+                            [(u + width) as f32, v as f32, slice as f32],
+                            [u as f32, v as f32, slice as f32],
+                            [u as f32, (v + height) as f32, slice as f32],
+                            [(u + width) as f32, (v + height) as f32, slice as f32],
+                        ],
+                        BlockFace::South => [
+                            [u as f32, v as f32, (slice + 1) as f32],
+                            [(u + width) as f32, v as f32, (slice + 1) as f32],
+                            [(u + width) as f32, (v + height) as f32, (slice + 1) as f32],
+                            [u as f32, (v + height) as f32, (slice + 1) as f32],
+                        ],
+                        BlockFace::East => [
+                            [(slice + 1) as f32, v as f32, (u + width) as f32],
+                            [(slice + 1) as f32, v as f32, u as f32],
+                            [(slice + 1) as f32, (v + height) as f32, u as f32],
+                            [(slice + 1) as f32, (v + height) as f32, (u + width) as f32],
+                        ],
+                        BlockFace::West => [
+                            [slice as f32, v as f32, u as f32],
+                            [slice as f32, v as f32, (u + width) as f32],
+                            [slice as f32, (v + height) as f32, (u + width) as f32],
+                            [slice as f32, (v + height) as f32, u as f32],
+                        ],
+                    };
 
-                    p0[axis] = offset_axis;
-                    p1[axis] = offset_axis;
-                    p2[axis] = offset_axis;
-                    p3[axis] = offset_axis;
+                    let uvs: [[f32; 2]; 4] = [
+                        [0.0, h_f],
+                        [w_f, h_f],
+                        [w_f, 0.0],
+                        [0.0, 0.0],
+                    ];
+                    let aos = [ao0, ao1, ao2, ao3];
 
-                    match face {
-                        BlockFace::Top => {
-                            p0[0] = u_min; p0[2] = v_min;
-                            p1[0] = u_max; p1[2] = v_min;
-                            p2[0] = u_max; p2[2] = v_max;
-                            p3[0] = u_min; p3[2] = v_max;
-                        }
-                        BlockFace::Bottom => {
-                            p0[0] = u_min; p0[2] = v_max;
-                            p1[0] = u_max; p1[2] = v_max;
-                            p2[0] = u_max; p2[2] = v_min;
-                            p3[0] = u_min; p3[2] = v_min;
-                        }
-                        BlockFace::North => {
-                            p0[0] = u_max; p0[1] = v_min;
-                            p1[0] = u_min; p1[1] = v_min;
-                            p2[0] = u_min; p2[1] = v_max;
-                            p3[0] = u_max; p3[1] = v_max;
-                        }
-                        BlockFace::South => {
-                            p0[0] = u_min; p0[1] = v_min;
-                            p1[0] = u_max; p1[1] = v_min;
-                            p2[0] = u_max; p2[1] = v_max;
-                            p3[0] = u_min; p3[1] = v_max;
-                        }
-                        BlockFace::East => {
-                            p0[2] = u_min; p0[1] = v_min;
-                            p1[2] = u_max; p1[1] = v_min;
-                            p2[2] = u_max; p2[1] = v_max;
-                            p3[2] = u_min; p3[1] = v_max;
-                        }
-                        BlockFace::West => {
-                            p0[2] = u_max; p0[1] = v_min;
-                            p1[2] = u_min; p1[1] = v_min;
-                            p2[2] = u_min; p2[1] = v_max;
-                            p3[2] = u_max; p3[1] = v_max;
-                        }
+                    for i in 0..4 {
+                        mesh.vertices.push(VoxelVertex {
+                            position: [
+                                base_origin.x + corners_local[i][0] * voxel_scale,
+                                base_origin.y + corners_local[i][1] * voxel_scale,
+                                base_origin.z + corners_local[i][2] * voxel_scale,
+                            ],
+                            normal,
+                            color,
+                            ao: aos[i],
+                            uv: uvs[i],
+                            tex_id,
+                            material_params: [
+                                def.roughness,
+                                def.metallic,
+                                def.shading_model as u32 as f32,
+                                def.subsurface,
+                            ],
+                        });
                     }
 
-                    let v0 = chunk_base + Vec3::from_array(p0) * voxel_scale;
-                    let v1 = chunk_base + Vec3::from_array(p1) * voxel_scale;
-                    let v2 = chunk_base + Vec3::from_array(p2) * voxel_scale;
-                    let v3 = chunk_base + Vec3::from_array(p3) * voxel_scale;
-
-                    let u_scale = width as f32;
-                    let v_scale = height as f32;
-
-                    let base_idx = mesh.vertices.len() as u32;
-                    let ao = face_voxel.ao_levels;
-
-                    mesh.vertices.push(VoxelVertex {
-                        position: v0.to_array(),
-                        normal,
-                        color,
-                        ao: AO_CURVE[ao[0] as usize],
-                        uv: [0.0, 0.0],
-                        tex_id,
-                        material_params: mat_params,
-                    });
-                    mesh.vertices.push(VoxelVertex {
-                        position: v1.to_array(),
-                        normal,
-                        color,
-                        ao: AO_CURVE[ao[1] as usize],
-                        uv: [u_scale, 0.0],
-                        tex_id,
-                        material_params: mat_params,
-                    });
-                    mesh.vertices.push(VoxelVertex {
-                        position: v2.to_array(),
-                        normal,
-                        color,
-                        ao: AO_CURVE[ao[2] as usize],
-                        uv: [u_scale, v_scale],
-                        tex_id,
-                        material_params: mat_params,
-                    });
-                    mesh.vertices.push(VoxelVertex {
-                        position: v3.to_array(),
-                        normal,
-                        color,
-                        ao: AO_CURVE[ao[3] as usize],
-                        uv: [0.0, v_scale],
-                        tex_id,
-                        material_params: mat_params,
-                    });
-
-                    // AO interpolation diagonal flip
-                    if (ao[0] as i32 + ao[2] as i32) > (ao[1] as i32 + ao[3] as i32) {
+                    // Flip quad triangulation if diagonal AO gradient would crease
+                    if aos[0] + aos[2] < aos[1] + aos[3] {
                         mesh.indices.extend_from_slice(&[
                             base_idx + 1,
                             base_idx + 2,
@@ -1898,8 +1893,6 @@ pub fn build_chunk_mesh(
                             base_idx + 3,
                         ]);
                     }
-
-                    u += width;
                 }
             }
         }

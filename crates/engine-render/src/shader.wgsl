@@ -183,32 +183,40 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var lit_color = vec3<f32>(0.0);
 
     if (shading_model == 4u) {
-        // --- 4. Realistic Shader Water (Waves, Fresnel reflection, caustics, and foam) ---
+        // --- 4. Realistic Cinematic Water (Multi-frequency ripples, Fresnel, caustics, and specular) ---
         let time = scene.sky_zenith.w;
-        let wave1 = sin(in.world_pos.x * 0.95 + in.world_pos.z * 0.85 + time * 2.2) * 0.08;
-        let wave2 = cos(in.world_pos.x * 1.65 - in.world_pos.z * 1.45 + time * 3.1) * 0.06;
-        let wave_norm = normalize(vec3<f32>(wave1 + wave2, 1.0, wave1 - wave2));
-        let water_N = normalize(mix(N, wave_norm, 0.40));
+        let wp = in.world_pos.xz;
+        
+        // Two dual-frequency ripple directions creating gentle, organic water currents
+        let r1 = sin(wp.x * 1.4 + wp.y * 1.1 + time * 1.6) * 0.025;
+        let r2 = cos(wp.x * 2.2 - wp.y * 1.8 + time * 2.1) * 0.020;
+        let r3 = sin(-wp.x * 3.1 + wp.y * 2.6 + time * 2.8) * 0.012;
+        let ripple_n = normalize(vec3<f32>(r1 + r2, 1.0, r2 + r3));
+        let water_N = normalize(mix(N, ripple_n, 0.42));
 
         let water_ndotl = max(dot(water_N, L), 0.0);
         let water_ndotv = max(dot(water_N, V), 0.001);
         let water_H = normalize(V + L);
         let water_ndoth = max(dot(water_N, water_H), 0.0);
 
-        let shallow_color = vec3<f32>(0.07, 0.45, 0.65);
-        let deep_color = vec3<f32>(0.02, 0.15, 0.35);
-        let water_base = mix(shallow_color, deep_color, 0.55);
+        // Crystal azure to deep navy depth gradient
+        let shallow_water = vec3<f32>(0.10, 0.55, 0.72);
+        let deep_water = vec3<f32>(0.02, 0.16, 0.38);
+        let water_base = mix(shallow_water, deep_water, 0.55);
 
-        let fresnel = pow(1.0 - water_ndotv, 4.0);
-        let sky_reflection = mix(scene.ambient_sky.rgb * 1.25, scene.sun_color.rgb, 0.30);
+        // Physical Fresnel equation for water (Schlick approximation)
+        let fresnel = pow(clamp(1.0 - water_ndotv, 0.0, 1.0), 3.5);
+        let sky_refl = mix(scene.ambient_sky.rgb * 1.35, scene.sun_color.rgb, 0.28);
 
-        let spec_power = pow(water_ndoth, 96.0) * 1.65 * shadow_factor;
+        // Sunlight specular glimmer with sharp highlight
+        let spec_power = pow(water_ndoth, 128.0) * 2.8 * shadow_factor;
         let water_sun = sun_light * water_ndotl * shadow_factor;
 
-        let foam = pow(clamp(wave1 + wave2 + 0.05, 0.0, 1.0), 3.0) * 0.30;
+        // Animated caustic light dispersion on the surface
+        let caustic = pow(sin(wp.x * 3.5 + time * 1.8) * sin(wp.y * 3.5 - time * 1.8) * 0.5 + 0.5, 3.0) * 0.08;
 
-        let final_water = mix(water_base * (ambient + water_sun), sky_reflection, fresnel * 0.82)
-                        + vec3<f32>(foam) + scene.sun_color.rgb * spec_power;
+        let final_water = mix(water_base * (ambient * 0.90 + water_sun * 0.80 + caustic), sky_refl, fresnel * 0.76)
+                        + scene.sun_color.rgb * spec_power;
 
         lit_color = final_water;
     } else if (shading_model == 3u) {
@@ -273,7 +281,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     var out_alpha = 1.0;
     if (shading_model == 4u) {
-        out_alpha = 0.85;
+        let fresnel_a = pow(clamp(1.0 - max(dot(N, V), 0.001), 0.0, 1.0), 2.5);
+        out_alpha = mix(0.72, 0.95, fresnel_a);
     }
 
     return vec4<f32>(tonemap_filmic(fogged_color), out_alpha);

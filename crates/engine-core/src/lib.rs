@@ -201,12 +201,24 @@ pub enum BlockTransparency {
     Translucent,
 }
 
+/// Structural mesh geometry type of a block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlockGeometry {
+    #[default]
+    Cube,
+    Cross,
+}
+
 /// Data-driven definition of a block type.
 #[derive(Debug, Clone)]
 pub struct BlockDef {
     pub name: String,
     pub solid: bool,
     pub opaque: bool,
+    /// Mesh geometry (Cube or Cross-quad).
+    pub geometry: BlockGeometry,
+    /// 7 Days to Die durability pool (HP).
+    pub max_health: f32,
     /// RGB color tint per face (`[Top, Bottom, North, South, East, West]`).
     pub face_colors: [[f32; 3]; 6],
     /// Texture array index per face (`[Top, Bottom, North, South, East, West]`).
@@ -247,6 +259,8 @@ impl BlockDef {
             name: name.into(),
             solid: true,
             opaque: true,
+            geometry: BlockGeometry::Cube,
+            max_health: 200.0,
             face_colors: [top, bottom, side, side, side, side],
             face_textures: [0; 6],
             face_materials: [MaterialId::DEFAULT; 6],
@@ -259,6 +273,21 @@ impl BlockDef {
             hardness: 1.0,
             icon_color: [icon_r, icon_g, icon_b],
         }
+    }
+
+    pub fn with_health(mut self, hp: f32) -> Self {
+        self.max_health = hp.max(1.0);
+        self
+    }
+
+    pub fn with_geometry(mut self, geo: BlockGeometry) -> Self {
+        self.geometry = geo;
+        self
+    }
+
+    pub fn with_solid(mut self, solid: bool) -> Self {
+        self.solid = solid;
+        self
     }
 
     pub fn with_icon_color(mut self, color: [u8; 3]) -> Self {
@@ -386,6 +415,8 @@ impl BlockRegistry {
             name: "core:air".to_string(),
             solid: false,
             opaque: false,
+            geometry: BlockGeometry::Cube,
+            max_health: 0.0,
             face_colors: [[0.0; 3]; 6],
             face_textures: [0; 6],
             face_materials: [MaterialId::DEFAULT; 6],

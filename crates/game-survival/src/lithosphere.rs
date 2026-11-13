@@ -25,6 +25,8 @@ pub struct LithosphereWorldGen {
     pub bedrock: BlockId,
     pub wood: BlockId,
     pub leaves: BlockId,
+    pub tall_grass: BlockId,
+    pub shrub: BlockId,
 
     // Deep geology
     pub deepslate: BlockId,
@@ -80,6 +82,8 @@ impl LithosphereWorldGen {
             bedrock: find("survival:bedrock"),
             wood: find("survival:wood"),
             leaves: find("survival:leaves"),
+            tall_grass: find("survival:tall_grass"),
+            shrub: find("survival:shrub"),
 
             deepslate: find("survival:deepslate"),
             tuff: find("survival:tuff"),
@@ -389,6 +393,31 @@ impl WorldGenerator for LithosphereWorldGen {
                         if lx >= 0 && lx < cs && ly >= 0 && ly < cs && lz >= 0 && lz < cs {
                             let idx = lx as usize + lz as usize * chunk_size + ly as usize * chunk_size * chunk_size;
                             out[idx] = self.wood;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 6. Surface foliage pass (wild prairie grass & shrubs on open grass)
+        for lz in 0..cs {
+            for lx in 0..cs {
+                let wx = base_x + lx;
+                let wz = base_z + lz;
+                let (surface_y, is_river) = self.surface_height(wx, wz);
+                if is_river || surface_y <= SEA_LEVEL || surface_y > 48 {
+                    continue;
+                }
+                let plant_y = surface_y + 1;
+                let ly = plant_y - base_y;
+                if ly >= 0 && ly < cs {
+                    let idx = lx as usize + lz as usize * chunk_size + ly as usize * chunk_size * chunk_size;
+                    if out[idx] == BlockId::AIR {
+                        let h = hash2(wx, wz, self.seed.wrapping_add(777));
+                        if h % 100 < 28 {
+                            out[idx] = self.tall_grass;
+                        } else if h % 100 < 34 {
+                            out[idx] = self.shrub;
                         }
                     }
                 }

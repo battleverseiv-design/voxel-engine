@@ -4,7 +4,7 @@ pub mod lithosphere;
 pub use lithosphere::LithosphereWorldGen;
 
 use engine_core::{
-    BlockDef, BlockId, BlockRegistry, BlockTransparency, GameMode, ShadingModel, WorldGenerator,
+    BlockDef, BlockGeometry, BlockId, BlockRegistry, BlockTransparency, GameMode, ShadingModel, WorldGenerator,
 };
 use glam::{IVec3, Vec3};
 
@@ -714,6 +714,58 @@ impl GameMode for SurvivalMode {
         water_def.solid = false;
         water_def.opaque = false;
         registry.register(water_def);
+
+        // 74. Tall Grass (Wild prairie grass, drops plant fibers)
+        let mut grass_def = BlockDef::solid_tinted(
+            "survival:tall_grass",
+            [0.55, 0.85, 0.35],
+            [0.55, 0.85, 0.35],
+            [0.55, 0.85, 0.35],
+        )
+        .with_texture(81)
+        .with_geometry(BlockGeometry::Cross)
+        .with_transparency(BlockTransparency::Cutout)
+        .with_shading(ShadingModel::Foliage)
+        .with_health(35.0)
+        .with_hardness(0.1)
+        .with_icon_color([110, 185, 65]);
+        grass_def.solid = false;
+        grass_def.opaque = false;
+        registry.register(grass_def);
+
+        // 75. Shrub / Bush (Dry wild bush, drops sticks & fibers)
+        let mut shrub_def = BlockDef::solid_tinted(
+            "survival:shrub",
+            [0.65, 0.72, 0.42],
+            [0.65, 0.72, 0.42],
+            [0.65, 0.72, 0.42],
+        )
+        .with_texture(82)
+        .with_geometry(BlockGeometry::Cross)
+        .with_transparency(BlockTransparency::Cutout)
+        .with_shading(ShadingModel::Foliage)
+        .with_health(45.0)
+        .with_hardness(0.2)
+        .with_icon_color([130, 140, 80]);
+        shrub_def.solid = false;
+        shrub_def.opaque = false;
+        registry.register(shrub_def);
+
+        // 76. Plant Fiber (Harvested raw fiber for crafting)
+        registry.register(
+            BlockDef::solid_tinted("survival:plant_fiber", [0.72, 0.68, 0.38], [0.72, 0.68, 0.38], [0.72, 0.68, 0.38])
+                .with_texture(83)
+                .with_health(20.0)
+                .with_icon_color([175, 165, 95]),
+        );
+
+        // 77. Wooden Stick (Fallen branch / twig for crafting)
+        registry.register(
+            BlockDef::solid_tinted("survival:stick", [0.55, 0.40, 0.25], [0.55, 0.40, 0.25], [0.55, 0.40, 0.25])
+                .with_texture(84)
+                .with_health(25.0)
+                .with_icon_color([140, 100, 60]),
+        );
     }
 
     fn create_generator(&self, registry: &BlockRegistry) -> Arc<dyn WorldGenerator> {

@@ -82,6 +82,10 @@ pub const RAW_BLOCK_TEXTURES: &[(&str, &[u8])] = &[
     ("deepslate_diamond_ore", include_bytes!("../../../assets/textures/blocks/deepslate_diamond_ore.png")),
     ("deepslate_emerald_ore", include_bytes!("../../../assets/textures/blocks/deepslate_emerald_ore.png")),
     ("water_still", include_bytes!("../../../assets/textures/blocks/water_still.png")),
+    ("tall_grass", include_bytes!("../../../assets/textures/blocks/tall_grass.png")),
+    ("shrub", include_bytes!("../../../assets/textures/blocks/shrub.png")),
+    ("plant_fiber", include_bytes!("../../../assets/textures/blocks/plant_fiber.png")),
+    ("stick", include_bytes!("../../../assets/textures/blocks/stick.png")),
 ];
 
 pub fn load_texture_array_data() -> (Vec<u8>, u32) {

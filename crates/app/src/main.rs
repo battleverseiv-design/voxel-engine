@@ -155,7 +155,6 @@ struct EngineApp {
     inventory: Inventory,
     break_target: Option<IVec3>,
     break_progress: f32,
-    break_time: f32,
     inventory_open: bool,
     held_stack: Option<ItemStack>,
     settings: Settings,
@@ -229,6 +228,8 @@ struct EngineApp {
     join_password_input: String,
     dropped_items: Vec<DroppedItem>,
     next_dropped_item_id: u64,
+    damaged_blocks: HashMap<IVec3, f32>,
+    creative_break_cooldown: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -573,7 +574,6 @@ impl EngineApp {
             inventory,
             break_target: None,
             break_progress: 0.0,
-            break_time: 1.0,
             inventory_open: false,
             held_stack: None,
             connect_ip_input: settings.last_connected_ip.clone(),
@@ -647,6 +647,8 @@ impl EngineApp {
             join_password_input: String::new(),
             dropped_items: Vec::new(),
             next_dropped_item_id: 1,
+            damaged_blocks: HashMap::new(),
+            creative_break_cooldown: 0.0,
         };
 
         app.push_chat(
@@ -912,6 +914,7 @@ impl EngineApp {
     }
 
     fn apply_and_broadcast_block(&mut self, pos: IVec3, block_id: BlockId) {
+        self.damaged_blocks.remove(&pos);
         self.world.set_block(pos, block_id);
 
         let (chunk_pos, [lx, ly, lz]) = world_to_chunk(pos);
@@ -1419,35 +1422,78 @@ impl EngineApp {
         }
 
 
-        // Gradual block mining logic
+        // Creative break cooldown timer
+        if self.creative_break_cooldown > 0.0 {
+            self.creative_break_cooldown = (self.creative_break_cooldown - dt).max(0.0);
+        }
+        if !self.lmb_held {
+            self.creative_break_cooldown = 0.0;
+        }
+
+        // Block mining logic (Creative cadence + 7 Days to Die health pool)
         if self.screen == MenuScreen::Playing && !self.chat_open && !self.inventory_open && self.lmb_held && self.health > 0.0 {
             let hit = self.world.raycast(self.camera.position, self.camera.forward(), 6.5, &self.registry);
             if let Some(hit) = hit {
                 let block_name = self.registry.get(hit.block).map(|d| d.name.clone()).unwrap_or_default();
                 if self.player_mode == PlayerMode::Creative {
-                    self.apply_and_broadcast_block(hit.hit_pos, BlockId::AIR);
-                    audio::play_block_break(&block_name, Some(hit.hit_pos.as_vec3()));
-                    let local_meshes = self.world.rebuild_dirty_meshes(&self.registry, 8);
-                    if !local_meshes.is_empty() {
-                        if let Some(renderer) = &mut self.renderer {
-                            renderer.upload_chunk_meshes(local_meshes);
-                        }
-                    }
-                    self.break_target = None;
-                    self.break_progress = 0.0;
-                } else if Some(hit.hit_pos) == self.break_target {
-                    let prev_p = self.break_progress;
-                    self.break_progress += dt / self.break_time.max(0.05);
-                    if (prev_p * self.break_time / 0.25).floor() < (self.break_progress * self.break_time / 0.25).floor() {
-                        audio::play_block_hit(&block_name, Some(hit.hit_pos.as_vec3()));
-                    }
-                    if self.break_progress >= 1.0 {
+                    if self.creative_break_cooldown <= 0.0 {
                         self.apply_and_broadcast_block(hit.hit_pos, BlockId::AIR);
                         audio::play_block_break(&block_name, Some(hit.hit_pos.as_vec3()));
+                        let local_meshes = self.world.rebuild_dirty_meshes(&self.registry, 8);
+                        if !local_meshes.is_empty() {
+                            if let Some(renderer) = &mut self.renderer {
+                                renderer.upload_chunk_meshes(local_meshes);
+                            }
+                        }
+                        self.break_target = None;
+                        self.break_progress = 0.0;
+                        self.creative_break_cooldown = 0.22;
+                    }
+                } else {
+                    let max_hp = self.registry.get(hit.block).map(|d| d.max_health).unwrap_or(200.0);
+                    let mut cur_hp = self.damaged_blocks.get(&hit.hit_pos).copied().unwrap_or(max_hp);
+
+                    // Mining damage rate per second (fist = 90 DPS, tool = 240 DPS)
+                    let dps = if let Some(held) = self.inventory.selected_item() {
+                        let name = self.registry.get(held.block_id).map(|d| d.name.as_str()).unwrap_or("");
+                        if name.contains("pickaxe") || name.contains("axe") || name.contains("sword") {
+                            240.0
+                        } else {
+                            90.0
+                        }
+                    } else {
+                        90.0
+                    };
+
+                    let prev_hp = cur_hp;
+                    cur_hp -= dps * dt;
+
+                    let is_new_target = self.break_target != Some(hit.hit_pos);
+                    let prev_step = (prev_hp / 25.0).floor();
+                    let cur_step = (cur_hp / 25.0).floor();
+                    if is_new_target || prev_step != cur_step {
+                        audio::play_block_hit(&block_name, Some(hit.hit_pos.as_vec3()));
+                    }
+
+                    self.break_target = Some(hit.hit_pos);
+
+                    if cur_hp <= 0.0 {
+                        self.damaged_blocks.remove(&hit.hit_pos);
+                        self.apply_and_broadcast_block(hit.hit_pos, BlockId::AIR);
+                        audio::play_block_break(&block_name, Some(hit.hit_pos.as_vec3()));
+
+                        let drop_id = if block_name.contains("tall_grass") {
+                            self.registry.find("survival:plant_fiber").unwrap_or(hit.block)
+                        } else if block_name.contains("shrub") {
+                            self.registry.find("survival:stick").unwrap_or(hit.block)
+                        } else {
+                            hit.block
+                        };
+
                         let drop_pos = hit.hit_pos.as_vec3() + Vec3::new(0.5, 0.4, 0.5);
                         let rnd_x = ((self.time_of_day * 133.0).sin()) * 1.2;
                         let rnd_z = ((self.time_of_day * 277.0).cos()) * 1.2;
-                        self.spawn_dropped_item(hit.block, 1, drop_pos, Vec3::new(rnd_x, 2.8, rnd_z));
+                        self.spawn_dropped_item(drop_id, 1, drop_pos, Vec3::new(rnd_x, 2.8, rnd_z));
                         self.break_target = None;
                         self.break_progress = 0.0;
                         let local_meshes = self.world.rebuild_dirty_meshes(&self.registry, 8);
@@ -1456,13 +1502,10 @@ impl EngineApp {
                                 renderer.upload_chunk_meshes(local_meshes);
                             }
                         }
+                    } else {
+                        self.damaged_blocks.insert(hit.hit_pos, cur_hp);
+                        self.break_progress = ((max_hp - cur_hp) / max_hp).clamp(0.0, 1.0);
                     }
-                } else {
-                    self.break_target = Some(hit.hit_pos);
-                    self.break_progress = 0.0;
-                    let hardness = self.registry.get(hit.block).map(|d| d.hardness).unwrap_or(1.0);
-                    self.break_time = (hardness * 0.8).max(0.1);
-                    audio::play_block_hit(&block_name, Some(hit.hit_pos.as_vec3()));
                 }
             } else {
                 self.break_target = None;
@@ -2097,10 +2140,26 @@ impl EngineApp {
         let pos = self.camera.position;
         let selected_slot = self.inventory.selected_hotbar;
         let inventory_slots = self.inventory.slots;
-        let break_progress = self.break_progress;
+        let _break_progress = self.break_progress;
         let inventory_open = self.inventory_open;
         let held_stack = self.held_stack;
         let registry = Arc::clone(&self.registry);
+
+        let targeted_block_hp = if self.screen == MenuScreen::Playing && !self.chat_open && !self.inventory_open && self.health > 0.0 {
+            if let Some(hit) = self.world.raycast(self.camera.position, self.camera.forward(), 6.5, &self.registry) {
+                let max_hp = self.registry.get(hit.block).map(|d| d.max_health).unwrap_or(200.0);
+                let cur_hp = self.damaged_blocks.get(&hit.hit_pos).copied().unwrap_or(max_hp);
+                if cur_hp < max_hp - 0.5 || self.break_target == Some(hit.hit_pos) {
+                    Some((cur_hp, max_hp))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             // Minimalist HUD overlay (only in Playing mode)
@@ -2313,26 +2372,43 @@ impl EngineApp {
                     }
                 }
 
-                // Mining crack progress indicator
-                if break_progress > 0.01 {
-                    let p = break_progress.clamp(0.0, 1.0);
-                    let radius = 15.0_f32;
-                    let n_pts = (32.0 * p).ceil() as usize;
-                    if n_pts >= 2 {
-                        let pts: Vec<egui::Pos2> = (0..=n_pts)
-                            .map(|i| {
-                                let angle = (i as f32 / 32.0) * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
-                                center + egui::vec2(angle.cos() * radius, angle.sin() * radius)
-                            })
-                            .collect();
-                        for w in pts.windows(2) {
-                            painter.line_segment([w[0], w[1]], egui::Stroke::new(2.5_f32, egui::Color32::from_rgb(255, 185, 40)));
-                        }
-                    }
-                    let bar_rect = egui::Rect::from_center_size(center + egui::vec2(0.0, 24.0), egui::vec2(36.0, 4.0));
-                    painter.rect_filled(bar_rect, 2.0, egui::Color32::from_black_alpha(160));
-                    let fill_rect = egui::Rect::from_min_size(bar_rect.min, egui::vec2(36.0 * p, 4.0));
-                    painter.rect_filled(fill_rect, 2.0, egui::Color32::from_rgb(255, 195, 50));
+                // Bottom-Left Block HP indicator (7 Days to Die style)
+                if let Some((cur_hp, max_hp)) = targeted_block_hp {
+                    egui::Area::new(egui::Id::new("block_hp_indicator_bl"))
+                        .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(20.0, -18.0))
+                        .interactable(false)
+                        .show(ctx, |ui| {
+                            egui::Frame::NONE
+                                .fill(egui::Color32::from_black_alpha(175))
+                                .corner_radius(6.0)
+                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(35)))
+                                .inner_margin(egui::Margin::symmetric(10, 6))
+                                .show(ui, |ui| {
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!("{:.0} / {:.0}", cur_hp.max(0.0), max_hp))
+                                                .size(13.0)
+                                                .color(egui::Color32::WHITE)
+                                                .strong(),
+                                        );
+                                        ui.add_space(2.0);
+                                        let p = (cur_hp / max_hp).clamp(0.0, 1.0);
+                                        let (bar_rect, _) = ui.allocate_exact_size(egui::vec2(110.0, 5.0), egui::Sense::hover());
+                                        ui.painter().rect_filled(bar_rect, 2.5, egui::Color32::from_black_alpha(220));
+                                        if p > 0.0 {
+                                            let fill_rect = egui::Rect::from_min_size(bar_rect.min, egui::vec2(110.0 * p, 5.0));
+                                            let bar_color = if p > 0.5 {
+                                                egui::Color32::from_rgb(85, 215, 95)
+                                            } else if p > 0.25 {
+                                                egui::Color32::from_rgb(240, 190, 50)
+                                            } else {
+                                                egui::Color32::from_rgb(235, 65, 55)
+                                            };
+                                            ui.painter().rect_filled(fill_rect, 2.5, bar_color);
+                                        }
+                                    });
+                                });
+                        });
                 }
 
                 // Bottom Hotbar (Quick slot block selector)

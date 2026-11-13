@@ -8,7 +8,7 @@ use std::thread::{self, JoinHandle};
 
 use bytemuck::{Pod, Zeroable};
 use engine_core::{
-    BlockFace, BlockId, BlockRegistry, BlockTransparency, MaterialRegistry,
+    BlockFace, BlockGeometry, BlockId, BlockRegistry, BlockTransparency, MaterialRegistry,
     ReferenceFrameId, RelativeTransform, ShadingModel, WorldGenerator,
 };
 use glam::{IVec3, Vec3};
@@ -1511,7 +1511,14 @@ impl World {
 
         while dist <= max_dist_scaled {
             let block = self.get_block(voxel);
-            if registry.is_solid(block) {
+            let is_hit = if registry.is_solid(block) {
+                true
+            } else if let Some(def) = registry.get(block) {
+                def.geometry == BlockGeometry::Cross
+            } else {
+                false
+            };
+            if is_hit {
                 return Some(RaycastHit {
                     hit_pos: voxel,
                     place_pos: last_voxel,
@@ -1900,6 +1907,85 @@ pub fn build_chunk_mesh(
                             base_idx + 3,
                         ]);
                     }
+                }
+            }
+        }
+    }
+
+    // Cross-quad foliage pass (tall grass, shrubs, wild plants)
+    for y in 0..CHUNK_SIZE {
+        for z in 0..CHUNK_SIZE {
+            for x in 0..CHUNK_SIZE {
+                let id = chunk.get(x, y, z);
+                if id == BlockId::AIR {
+                    continue;
+                }
+                let Some(def) = registry.get(id) else {
+                    continue;
+                };
+                if def.geometry != BlockGeometry::Cross {
+                    continue;
+                }
+
+                let color = def.face_colors[0];
+                let tex_id = def.face_textures[0] as u32;
+                let mat_params = [
+                    def.roughness,
+                    def.metallic,
+                    def.shading_model as u32 as f32,
+                    def.subsurface,
+                ];
+
+                let bx = base_origin.x + x as f32 * voxel_scale;
+                let by = base_origin.y + y as f32 * voxel_scale;
+                let bz = base_origin.z + z as f32 * voxel_scale;
+                let s = voxel_scale;
+
+                // Diagonal Quad 1: (0, 0, 0) -> (1, 1, 1)
+                let c1 = [
+                    [bx, by, bz],
+                    [bx + s, by, bz + s],
+                    [bx + s, by + s, bz + s],
+                    [bx, by + s, bz],
+                ];
+                let norm1 = [0.7071, 0.0, -0.7071];
+
+                // Diagonal Quad 2: (0, 0, 1) -> (1, 1, 0)
+                let c2 = [
+                    [bx, by, bz + s],
+                    [bx + s, by, bz],
+                    [bx + s, by + s, bz],
+                    [bx, by + s, bz + s],
+                ];
+                let norm2 = [0.7071, 0.0, 0.7071];
+
+                let uvs: [[f32; 2]; 4] = [
+                    [0.0, 1.0],
+                    [1.0, 1.0],
+                    [1.0, 0.0],
+                    [0.0, 0.0],
+                ];
+
+                for (corners, norm) in [(c1, norm1), (c2, norm2)] {
+                    let base_idx = mesh.vertices.len() as u32;
+                    for i in 0..4 {
+                        mesh.vertices.push(VoxelVertex {
+                            position: corners[i],
+                            normal: norm,
+                            color,
+                            ao: 1.0,
+                            uv: uvs[i],
+                            tex_id,
+                            material_params: mat_params,
+                        });
+                    }
+                    // Emit two-sided quad
+                    mesh.indices.extend_from_slice(&[
+                        base_idx, base_idx + 1, base_idx + 2,
+                        base_idx, base_idx + 2, base_idx + 3,
+                        base_idx + 2, base_idx + 1, base_idx,
+                        base_idx + 3, base_idx + 2, base_idx,
+                    ]);
                 }
             }
         }

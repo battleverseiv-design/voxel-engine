@@ -610,7 +610,7 @@ impl Renderer {
 
         let avatar_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("avatar-vb"),
-            size: (8192 * std::mem::size_of::<VoxelVertex>()) as wgpu::BufferAddress,
+            size: (65536 * std::mem::size_of::<VoxelVertex>()) as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -843,7 +843,7 @@ impl Renderer {
 
         let avatar_vertex_count = if let Some(verts) = avatar_vertices {
             if !verts.is_empty() {
-                let count = verts.len().min(8192);
+                let count = verts.len().min(65536);
                 self.queue.write_buffer(
                     &self.avatar_vertex_buffer,
                     0,
